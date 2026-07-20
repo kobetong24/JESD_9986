@@ -1,0 +1,17 @@
+# Build artifacts
+debug/
+release/
+*.o
+*.dep
+*.gcno
+*.gcda
+
+# Log files
+*.log
+
+# SPI/logic analyser captures
+*.sal
+*.csv
+
+# Claude Code settings
+.claude/

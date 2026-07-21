@@ -345,22 +345,26 @@ static int32_t app_hmc7044_clk_config(adi_hmc7044_device_t *dev)
     uint8_t pri[4] = {1, 0, 2, 3};
 
     /* CH_2 → AD9986 device clock (board trace from HMC7044 CH_2 to AD9986 CLK input).
+     * CH_3/CH_13 → SYSREF 7.68 MHz (VCO/352 = 2703.36/352, divider is even).
      * CH_6 and CH_12 are additional 122.88 MHz outputs for FPGA / JESD reference.
      * NOTE: the output-disable loop from the ADS9 reference app is intentionally
      * omitted here.  On this Lattice board the FPGA JESD IP uses one of the
      * other HMC7044 outputs as its reference clock; disabling all outputs before
      * clk_config removes that clock and breaks the SPI register bridge on the
      * next run.  Outputs not listed in hmc_out_ch keep their init-table values. */
-    const uint16_t hmc_out_ch = HMC7044_OP_CH_2 | HMC7044_OP_CH_6 | HMC7044_OP_CH_12;
+    const uint16_t hmc_out_ch = HMC7044_OP_CH_2  | HMC7044_OP_CH_3  |
+                                 HMC7044_OP_CH_6  | HMC7044_OP_CH_12 |
+                                 HMC7044_OP_CH_13;
 
     uint64_t hmc_out_hz[14] = {
         0, 0,
         LATTICE_AD9986_DEV_CLK_HZ,  /* CH_2  → AD9986 device clock (122.88 MHz) */
-        0, 0, 0,
+        7680000ULL,                 /* CH_3  → SYSREF 7.68 MHz */
+        0, 0,
         122880000ULL,               /* CH_6  → 122.88 MHz */
         0, 0, 0, 0, 0,
         122880000ULL,               /* CH_12 → 122.88 MHz (JESD204 reference) */
-        0
+        7680000ULL                  /* CH_13 → SYSREF 7.68 MHz */
     };
 
     /* Step 1: CLKIN0 and CLKIN1 -- 100Ω differential termination, AC-coupled */
@@ -421,7 +425,7 @@ static int32_t app_hmc7044_clk_config(adi_hmc7044_device_t *dev)
     /* Step 8: allow PLL to settle before the caller checks lock status */
     lattice_wait_us(NULL, 100000);  /* 100 ms */
 
-    printf("HMC7044 clocks configured: ref=%.2f MHz  CH_2=%.2f MHz  CH_6=122.88 MHz  CH_12=122.88 MHz.\n",
+    printf("HMC7044 clocks configured: ref=%.2f MHz  CH_2=%.2f MHz  CH_3/CH_13=7.68 MHz (SYSREF)  CH_6=122.88 MHz  CH_12=122.88 MHz.\n",
            (double)ref_hz / 1.0e6,
            (double)LATTICE_AD9986_DEV_CLK_HZ / 1.0e6);
     return API_CMS_ERROR_OK;

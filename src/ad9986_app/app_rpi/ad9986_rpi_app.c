@@ -455,7 +455,10 @@ static int32_t app_hmc7044_ch13_status(adi_hmc7044_device_t *dev)
            ctrl0 & 1, (ctrl0 & 1) ? "(enabled)" : "(DISABLED)");
     printf("    [3:2] startup_mode      = %d  %s\n",
            (ctrl0 >> 2) & 3,
-           ((ctrl0 >> 2) & 3) == 0 ? "(continuous/running)" : "(non-zero: check startup state)");
+           ((ctrl0 >> 2) & 3) == 0 ? "(continuous clock -- not SYSREF mode)"
+         : (ctrl0 >> 2) & 3 == 1   ? "(startup pulse generator)"
+         : (ctrl0 >> 2) & 3 == 2   ? "(re-arm pulse generator)"
+                                   : "(pulse generator mode 3)");
     printf("    [5]   slip_en           = %d\n", (ctrl0 >> 5) & 1);
     printf("    [6]   sync_en           = %d\n", (ctrl0 >> 6) & 1);
     printf("    [7]   high_perform_en   = %d\n", (ctrl0 >> 7) & 1);
@@ -468,14 +471,14 @@ static int32_t app_hmc7044_ch13_status(adi_hmc7044_device_t *dev)
     printf("    force_mute      = %d\n", (ctrl8 >> 6) & 3);
 
     /* Summary */
-    int ch_enabled    = (ctrl0 & 1);
-    int startup_cont  = (((ctrl0 >> 2) & 3) == 0);
-    int divider_ok    = (divider == 704);
-    int not_muted     = (((ctrl8 >> 6) & 3) == 0);
+    int ch_enabled      = (ctrl0 & 1);
+    int startup_sysref  = (((ctrl0 >> 2) & 3) != 0); /* non-zero = pulse generator (SYSREF mode) */
+    int divider_ok      = (divider == 704);
+    int not_muted       = (((ctrl8 >> 6) & 3) == 0);
 
     printf("HMC7044 CH_13 SYSREF: %s\n",
-           (ch_enabled && startup_cont && divider_ok && not_muted)
-           ? "UP AND RUNNING (enabled, continuous, divider=704, not muted)"
+           (ch_enabled && startup_sysref && divider_ok && not_muted)
+           ? "UP AND RUNNING (enabled, SYSREF pulse-gen mode, divider=704, not muted)"
            : "NOT RUNNING (see detail above -- use option 6 to clear force_mute)");
 
     return API_CMS_ERROR_OK;
@@ -491,17 +494,29 @@ static int32_t app_hmc7044_ch13_unmute(adi_hmc7044_device_t *dev)
     int32_t err;
     uint8_t ctrl8 = 0;
 
-    if (err = adi_hmc7044_device_spi_register_set(dev, 0x0152, 0x00), err != API_CMS_ERROR_OK) {
-        printf("HMC7044 CH_13: SPI write 0x0152 failed (%d).\n", err);
-        return err;
-    }
-    printf("HMC7044 CH_13: CTRL_8 (0x0152) written 0x00 (force_mute cleared).\n");
-
+    /* Read-modify-write: clear only bits[7:6] (force_mute); preserve
+     * driver_mode[4:3] and driver_impedance[1:0] which were set by the API. */
     if (err = adi_hmc7044_device_spi_register_get(dev, 0x0152, &ctrl8), err != API_CMS_ERROR_OK) {
         printf("HMC7044 CH_13: SPI read 0x0152 failed (%d).\n", err);
         return err;
     }
-    printf("HMC7044 CH_13: CTRL_8 readback = 0x%02x  force_mute = %d  %s\n",
+    printf("HMC7044 CH_13: CTRL_8 before = 0x%02x  force_mute = %d\n",
+           ctrl8, (ctrl8 >> 6) & 3);
+
+    ctrl8 &= 0x3F; /* clear force_mute bits[7:6] */
+
+    if (err = adi_hmc7044_device_spi_register_set(dev, 0x0152, ctrl8), err != API_CMS_ERROR_OK) {
+        printf("HMC7044 CH_13: SPI write 0x0152 failed (%d).\n", err);
+        return err;
+    }
+
+    /* Readback to confirm */
+    ctrl8 = 0;
+    if (err = adi_hmc7044_device_spi_register_get(dev, 0x0152, &ctrl8), err != API_CMS_ERROR_OK) {
+        printf("HMC7044 CH_13: SPI read 0x0152 failed (%d).\n", err);
+        return err;
+    }
+    printf("HMC7044 CH_13: CTRL_8 after  = 0x%02x  force_mute = %d  %s\n",
            ctrl8,
            (ctrl8 >> 6) & 3,
            ((ctrl8 >> 6) & 3) == 0 ? "(not muted -- output active)"

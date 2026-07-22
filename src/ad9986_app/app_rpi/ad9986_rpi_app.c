@@ -965,6 +965,13 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
 
+    /* SPI1: clear CH_13 force_mute so the SYSREF output reaches the FPGA JESD IP.
+     * adi_hmc7044_clk_config() leaves CTRL_8 bits[7:6]=0b10 (always muted) on
+     * SYSREF channels; unmute must run after PLL lock is confirmed. */
+    if (err = app_hmc7044_ch13_unmute(&hmc7044_dev), err != API_CMS_ERROR_OK) {
+        goto cleanup;
+    }
+
     /* SPI0 CS1: reset, initialize and identify the AD9986 through the proxy. */
     if (err = app_ad9986_identify(&ad9986_dev), err != API_CMS_ERROR_OK) {
         goto cleanup;
@@ -980,6 +987,12 @@ int main(int argc, char *argv[])
     /* SPI0 CS1: verify the AD9986 clock PLL is locked.
      * status 0x3 = PLL_LOCK_FAST (bit0) + PLL_LOCK_SLOW (bit1). */
     if (err = app_ad9986_clk_pll_lock_check(&ad9986_dev), err != API_CMS_ERROR_OK) {
+        goto cleanup;
+    }
+
+    /* SPI0 CS1: configure AD9986 JESD204C datapath (uc_settings index 1 params).
+     * Requires AD9986 clock PLL locked (above) and HMC7044 CH_13 SYSREF active (above). */
+    if (err = app_ad9986_jesd204c_config(&ad9986_dev), err != API_CMS_ERROR_OK) {
         goto cleanup;
     }
 

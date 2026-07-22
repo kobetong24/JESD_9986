@@ -30,6 +30,9 @@
 #include "adi_cms_api_common.h"
 #include "adi_ads9.h"
 #include "lattice.h"
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
 
 /*============= C O D E ====================*/
 static int32_t app_jesd_ip_reg_write(uint32_t addr, uint32_t data)
@@ -456,8 +459,8 @@ static int32_t app_hmc7044_ch13_status(adi_hmc7044_device_t *dev)
     printf("    [3:2] startup_mode      = %d  %s\n",
            (ctrl0 >> 2) & 3,
            ((ctrl0 >> 2) & 3) == 0 ? "(continuous clock -- not SYSREF mode)"
-         : (ctrl0 >> 2) & 3 == 1   ? "(startup pulse generator)"
-         : (ctrl0 >> 2) & 3 == 2   ? "(re-arm pulse generator)"
+         : ((ctrl0 >> 2) & 3) == 1 ? "(startup pulse generator)"
+         : ((ctrl0 >> 2) & 3) == 2 ? "(re-arm pulse generator)"
                                    : "(pulse generator mode 3)");
     printf("    [5]   slip_en           = %d\n", (ctrl0 >> 5) & 1);
     printf("    [6]   sync_en           = %d\n", (ctrl0 >> 6) & 1);
@@ -685,6 +688,80 @@ static int32_t app_hmc7044_init(adi_hmc7044_device_t *dev)
     return API_CMS_ERROR_OK;
 }
 
+/* ── PLL monitor (background thread) ─────────────────────────────────────
+ *
+ * Polls HMC7044 and AD9986 clock PLL lock status every PLL_MONITOR_INTERVAL_S
+ * seconds.  Only prints when status changes from the last observed value;
+ * a WARNING is emitted on any unlock and a recovery notice on re-lock.
+ *
+ * Override the interval at build time: -DPLL_MONITOR_INTERVAL_S=<n>
+ * g_spi_mtx serialises SPI bus access between this thread and the main thread
+ * menu handlers; acquire it around any API call outside of startup. */
+
+#ifndef PLL_MONITOR_INTERVAL_S
+#define PLL_MONITOR_INTERVAL_S 5
+#endif
+
+typedef struct {
+    adi_hmc7044_device_t *hmc;
+    adi_ad9986_device_t  *ad9;
+} pll_mon_ctx_t;
+
+static pthread_mutex_t g_spi_mtx  = PTHREAD_MUTEX_INITIALIZER;
+static volatile int    g_mon_stop = 0;
+static uint8_t g_hmc_pll_state    = 0xFF; /* 0xFF = not yet seeded */
+static uint8_t g_ad9_pll_state    = 0xFF;
+
+static void *pll_monitor_thread(void *arg)
+{
+    pll_mon_ctx_t *ctx = (pll_mon_ctx_t *)arg;
+
+    while (!g_mon_stop) {
+        int     tick;
+        uint8_t hmc_st;
+        uint8_t ad9_st;
+
+        /* Sleep in 100 ms slices so the thread reacts promptly to g_mon_stop. */
+        for (tick = 0; tick < PLL_MONITOR_INTERVAL_S * 10 && !g_mon_stop; tick++)
+            usleep(100000);
+
+        if (g_mon_stop)
+            break;
+
+        hmc_st = 0;
+        ad9_st = 0;
+
+        pthread_mutex_lock(&g_spi_mtx);
+
+        if (adi_hmc7044_device_pll_lock_status_get(ctx->hmc, &hmc_st) == API_CMS_ERROR_OK
+                && hmc_st != g_hmc_pll_state) {
+            if (!(hmc_st & HMC7044_PLL1_AND_PLL2_LOCK_ST))
+                printf("\n[PLL MONITOR] WARNING: HMC7044 PLL not locked"
+                       " (0x%02x  PLL1=%s  PLL2=%s)\n", hmc_st,
+                       (hmc_st & HMC7044_PLL1_LOCK_ST) ? "ok" : "UNLOCKED",
+                       (hmc_st & HMC7044_PLL2_LOCK_ST) ? "ok" : "UNLOCKED");
+            else
+                printf("\n[PLL MONITOR] HMC7044 PLL lock restored (0x%02x).\n", hmc_st);
+            g_hmc_pll_state = hmc_st;
+        }
+
+        if (adi_ad9986_device_clk_pll_lock_status_get(ctx->ad9, &ad9_st) == API_CMS_ERROR_OK
+                && ad9_st != g_ad9_pll_state) {
+            if (ad9_st != 0x03)
+                printf("\n[PLL MONITOR] WARNING: AD9986 clock PLL not locked"
+                       " (0x%02x  FAST=%s  SLOW=%s)\n", ad9_st,
+                       (ad9_st & 0x01) ? "ok" : "UNLOCKED",
+                       (ad9_st & 0x02) ? "ok" : "UNLOCKED");
+            else
+                printf("\n[PLL MONITOR] AD9986 clock PLL lock restored (0x%02x).\n", ad9_st);
+            g_ad9_pll_state = ad9_st;
+        }
+
+        pthread_mutex_unlock(&g_spi_mtx);
+    }
+    return NULL;
+}
+
 static const char *prbs_pattern_name(adi_cms_jesd_prbs_pattern_e prbs)
 {
     switch (prbs) {
@@ -871,8 +948,11 @@ static int32_t app_ad9986_jesd204c_config(adi_ad9986_device_t *dev)
 
 int main(int argc, char *argv[])
 {
-    int32_t err;
-    int32_t readback;
+    int32_t       err;
+    int32_t       readback;
+    pthread_t     mon_thread;
+    int           mon_started = 0;
+    pll_mon_ctx_t mon_ctx;
 
     /* AD9986 on SPI0 CS1 (proxied by the Lattice FPGA), 4-wire, MSB first. */
     adi_ad9986_device_t ad9986_dev = {
@@ -996,6 +1076,26 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
 
+    /* Seed PLL monitor state from current known-good values so the first poll
+     * only prints on a change, then start the background thread. */
+    {
+        uint8_t st = 0;
+        if (adi_hmc7044_device_pll_lock_status_get(&hmc7044_dev, &st) == API_CMS_ERROR_OK)
+            g_hmc_pll_state = st;
+        if (adi_ad9986_device_clk_pll_lock_status_get(&ad9986_dev, &st) == API_CMS_ERROR_OK)
+            g_ad9_pll_state = st;
+    }
+    mon_ctx.hmc = &hmc7044_dev;
+    mon_ctx.ad9 = &ad9986_dev;
+    if (pthread_create(&mon_thread, NULL, pll_monitor_thread, &mon_ctx) == 0) {
+        printf("PLL monitor started (polling every %d s"
+               "  HMC7044=0x%02x  AD9986=0x%02x).\n",
+               PLL_MONITOR_INTERVAL_S, g_hmc_pll_state, g_ad9_pll_state);
+        mon_started = 1;
+    } else {
+        printf("PLL monitor: pthread_create failed -- monitoring disabled.\n");
+    }
+
     /* SPI0 CS0: write/read register verify now that all device clocks are up.
      * The Lattice FPGA JESD IP functional registers are in the device-clock
      * domain; they are writable only after HMC7044 and AD9986 clock PLLs
@@ -1021,20 +1121,24 @@ int main(int argc, char *argv[])
                 printf("Invalid input. Please enter 1-7.\n");
                 continue;
             }
-            if (user_choice == 1) {
-                err = app_jesd_ip_reg_verify();
-            } else if (user_choice == 2) {
-                app_jesd_ip_reg_read_test();
-            } else if (user_choice == 3) {
-                app_ad9986_link_status_check(&ad9986_dev);
-            } else if (user_choice == 4) {
-                app_ad9986_jesd204c_config(&ad9986_dev);
-            } else if (user_choice == 5) {
-                app_hmc7044_ch13_status(&hmc7044_dev);
-            } else if (user_choice == 6) {
-                app_hmc7044_ch13_unmute(&hmc7044_dev);
-            } else if (user_choice == 7) {
+            if (user_choice == 7) {
                 break;
+            } else if (user_choice >= 1 && user_choice <= 6) {
+                pthread_mutex_lock(&g_spi_mtx);
+                if (user_choice == 1) {
+                    err = app_jesd_ip_reg_verify();
+                } else if (user_choice == 2) {
+                    app_jesd_ip_reg_read_test();
+                } else if (user_choice == 3) {
+                    app_ad9986_link_status_check(&ad9986_dev);
+                } else if (user_choice == 4) {
+                    app_ad9986_jesd204c_config(&ad9986_dev);
+                } else if (user_choice == 5) {
+                    app_hmc7044_ch13_status(&hmc7044_dev);
+                } else {
+                    app_hmc7044_ch13_unmute(&hmc7044_dev);
+                }
+                pthread_mutex_unlock(&g_spi_mtx);
             } else {
                 printf("Invalid choice. Please enter 1-7.\n");
             }
@@ -1049,7 +1153,10 @@ int main(int argc, char *argv[])
     /* SPI0 CS0/CS1: FPGA JTX → AD9986 JRX PHY PRBS loopback test.
      * Runs after both PLLs are locked and the JESD IP is verified.
      * Change the pattern argument to PRBS9, PRBS15, PRBS23, or PRBS31 as needed. */
-    if (err = app_ad9986_prbs_test(&ad9986_dev, PRBS7), err != API_CMS_ERROR_OK) {
+    pthread_mutex_lock(&g_spi_mtx);
+    err = app_ad9986_prbs_test(&ad9986_dev, PRBS7);
+    pthread_mutex_unlock(&g_spi_mtx);
+    if (err != API_CMS_ERROR_OK) {
         goto cleanup;
     }
 
@@ -1064,6 +1171,11 @@ int main(int argc, char *argv[])
     printf("Control-plane bring-up complete.\n");
 
 cleanup:
+    if (mon_started) {
+        g_mon_stop = 1;
+        pthread_join(mon_thread, NULL);
+        printf("PLL monitor stopped.\n");
+    }
     lattice_user_data_free(&ad9986_dev.hal_info.user_data);
     lattice_user_data_free(&hmc7044_dev.hal_info.user_data);
     lattice_hw_close();

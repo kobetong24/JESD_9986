@@ -413,14 +413,14 @@ static int32_t app_ad9986_link_status_check(adi_ad9986_device_t *dev)
     return API_CMS_ERROR_OK;
 }
 
-/* Read HMC7044 CH_13 output control registers and report SYSREF channel status.
+/* Read HMC7044 CH_13 output control registers and report clock output status.
  *
- * CH_13 is the SYSREF output routed to the AD9986 (7.68 MHz from VCO 2703.36 MHz,
- * divider = 352 = 0x160).  There is no single "running" status bit — "up and
- * running" is confirmed by:
+ * CH_13 is a continuous 7.68 MHz clock output (VCO 2703.36 MHz ÷ divider 352).
+ * "Up and running" is confirmed by:
  *   - CTRL_0 bit[0] = 1  (channel enable)
- *   - CTRL_0 bits[3:2] = 0  (startup_mode = 0 = continuous, i.e. not held in reset)
+ *   - CTRL_0 bits[3:2] = 0  (startup_mode = 0 = continuous clock)
  *   - Divider (CTRL_1 + CTRL_2) = 352 = 0x160  (correct for 7.68 MHz output)
+ *   - CTRL_8 bits[7:6] = 0  (force_mute = 0, output active)
  *   - HMC7044 PLLs locked  (prerequisite — checked separately by app_hmc7044_pll_lock_check)
  *
  * CH_13 register base = 0x00C8 + 13 × 0x0A = 0x014A. */
@@ -452,7 +452,7 @@ static int32_t app_hmc7044_ch13_status(adi_hmc7044_device_t *dev)
 
     divider = (uint16_t)ctrl1 | ((uint16_t)(ctrl2 & 0x0F) << 8);
 
-    printf("HMC7044 CH_13 SYSREF output status:\n");
+    printf("HMC7044 CH_13 clock output status:\n");
     printf("  CTRL_0 (0x014A) = 0x%02x\n", ctrl0);
     printf("    [0]   channel enable    = %d  %s\n",
            ctrl0 & 1, (ctrl0 & 1) ? "(enabled)" : "(DISABLED)");
@@ -467,22 +467,22 @@ static int32_t app_hmc7044_ch13_status(adi_hmc7044_device_t *dev)
     printf("    [7]   high_perform_en   = %d\n", (ctrl0 >> 7) & 1);
     printf("  CTRL_1 (0x014B) = 0x%02x  (divider[7:0])\n", ctrl1);
     printf("  CTRL_2 (0x014C) = 0x%02x  (divider[11:8])\n", ctrl2 & 0x0F);
-    printf("  Channel divider = %u  (expected 704 = 0x2C0: sysref_timer for SYSREF channels)\n",
+    printf("  Channel divider = %u  (expected 352 = 0x160: VCO 2703.36 MHz / 7.68 MHz)\n",
            divider);
     printf("  CTRL_8 (0x0152) = 0x%02x  (driver: force_mute[7:6] drv_mode[4:3] impedance[1:0])\n",
            ctrl8);
     printf("    force_mute      = %d\n", (ctrl8 >> 6) & 3);
 
     /* Summary */
-    int ch_enabled      = (ctrl0 & 1);
-    int startup_sysref  = (((ctrl0 >> 2) & 3) != 0); /* non-zero = pulse generator (SYSREF mode) */
-    int divider_ok      = (divider == 704);
-    int not_muted       = (((ctrl8 >> 6) & 3) == 0);
+    int ch_enabled     = (ctrl0 & 1);
+    int startup_cont   = (((ctrl0 >> 2) & 3) == 0); /* 0 = continuous clock */
+    int divider_ok     = (divider == 352);
+    int not_muted      = (((ctrl8 >> 6) & 3) == 0);
 
-    printf("HMC7044 CH_13 SYSREF: %s\n",
-           (ch_enabled && startup_sysref && divider_ok && not_muted)
-           ? "UP AND RUNNING (enabled, SYSREF pulse-gen mode, divider=704, not muted)"
-           : "NOT RUNNING (see detail above -- use option 6 to clear force_mute)");
+    printf("HMC7044 CH_13: %s\n",
+           (ch_enabled && startup_cont && divider_ok && not_muted)
+           ? "UP AND RUNNING (enabled, continuous clock, divider=352, not muted)"
+           : "NOT RUNNING (see detail above)");
 
     return API_CMS_ERROR_OK;
 }
@@ -574,7 +574,7 @@ static int32_t app_hmc7044_clk_config(adi_hmc7044_device_t *dev)
     uint8_t pri[4] = {1, 0, 2, 3};
 
     /* CH_2 → AD9986 device clock (board trace from HMC7044 CH_2 to AD9986 CLK input).
-     * CH_3/CH_13 → SYSREF 7.68 MHz (VCO/352 = 2703.36/352, divider is even).
+     * CH_3  → SYSREF 7.68 MHz.  CH_13 → 7.68 MHz continuous clock (startup_mode=0).
      * CH_6 and CH_12 are additional 122.88 MHz outputs for FPGA / JESD reference.
      * NOTE: the output-disable loop from the ADS9 reference app is intentionally
      * omitted here.  On this Lattice board the FPGA JESD IP uses one of the
@@ -593,7 +593,7 @@ static int32_t app_hmc7044_clk_config(adi_hmc7044_device_t *dev)
         122880000ULL,               /* CH_6  → 122.88 MHz */
         0, 0, 0, 0, 0,
         122880000ULL,               /* CH_12 → 122.88 MHz (JESD204 reference) */
-        7680000ULL                  /* CH_13 → SYSREF 7.68 MHz */
+        7680000ULL                  /* CH_13 → 7.68 MHz continuous clock */
     };
 
     /* Step 1: CLKIN0 and CLKIN1 -- 100Ω differential termination, AC-coupled */
@@ -622,7 +622,18 @@ static int32_t app_hmc7044_clk_config(adi_hmc7044_device_t *dev)
         return err;
     }
 
-    /* Step 3: program PLL1/PLL2 dividers and output channel dividers */
+    /* Step 3: force CH_13 to continuous clock mode before adi_hmc7044_clk_config reads
+     * startup_mode.  The init table leaves CH_13 startup_mode=1 (SYSREF), which causes
+     * adi_hmc7044_clk_config to apply sysref_timer as the divider and set force_mute=2.
+     * Clearing startup_mode to 0 here makes the API take the clock branch instead:
+     * divider = VCO/7.68MHz = 352, force_mute = 0. */
+    if (err = adi_hmc7044_output_sync_config_set(dev, 13, 0, 0, 1),
+        err != API_CMS_ERROR_OK) {
+        printf("HMC7044: CH_13 startup_mode set failed (%d).\n", err);
+        return err;
+    }
+
+    /* Step 4: program PLL1/PLL2 dividers and output channel dividers */
     if (err = adi_hmc7044_clk_config(dev, HMC7044_CLK_IN_0, pri,
               ref_hz, ref_hz, hmc_out_ch, hmc_out_hz),
         err != API_CMS_ERROR_OK) {
@@ -632,7 +643,7 @@ static int32_t app_hmc7044_clk_config(adi_hmc7044_device_t *dev)
         return err;
     }
 
-    /* Steps 4-6: SYSREF enable, high-performance outputs, register commit, reseed */
+    /* Steps 5-8: SYSREF enable, high-performance outputs, register commit, reseed */
     if (err = adi_hmc7044_device_sysref_enable_control_set(dev, 1, 1),
         err != API_CMS_ERROR_OK) {
         printf("HMC7044: sysref enable failed (%d).\n", err);
@@ -654,7 +665,7 @@ static int32_t app_hmc7044_clk_config(adi_hmc7044_device_t *dev)
     /* Step 8: allow PLL to settle before the caller checks lock status */
     lattice_wait_us(NULL, 100000);  /* 100 ms */
 
-    printf("HMC7044 clocks configured: ref=%.2f MHz  CH_2=%.2f MHz  CH_3/CH_13=7.68 MHz (SYSREF)  CH_6=122.88 MHz  CH_12=122.88 MHz.\n",
+    printf("HMC7044 clocks configured: ref=%.2f MHz  CH_2=%.2f MHz  CH_3=7.68 MHz (SYSREF)  CH_13=7.68 MHz (continuous)  CH_6=122.88 MHz  CH_12=122.88 MHz.\n",
            (double)ref_hz / 1.0e6,
            (double)LATTICE_AD9986_DEV_CLK_HZ / 1.0e6);
     return API_CMS_ERROR_OK;
@@ -1042,13 +1053,6 @@ int main(int argc, char *argv[])
     /* SPI1: verify HMC7044 PLL1 and PLL2 are locked after clock configuration.
      * Required before trusting any clock output to downstream devices. */
     if (err = app_hmc7044_pll_lock_check(&hmc7044_dev), err != API_CMS_ERROR_OK) {
-        goto cleanup;
-    }
-
-    /* SPI1: clear CH_13 force_mute so the SYSREF output reaches the FPGA JESD IP.
-     * adi_hmc7044_clk_config() leaves CTRL_8 bits[7:6]=0b10 (always muted) on
-     * SYSREF channels; unmute must run after PLL lock is confirmed. */
-    if (err = app_hmc7044_ch13_unmute(&hmc7044_dev), err != API_CMS_ERROR_OK) {
         goto cleanup;
     }
 

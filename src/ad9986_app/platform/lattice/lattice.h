@@ -123,10 +123,10 @@
 #define LATTICE_HMC7044_REF_CLK_HZ   122880000ULL
 #endif
 
-/* AD9986 device clock frequency driven from HMC7044 CH_6 (Hz).
+/* AD9986 device clock frequency driven from HMC7044 CH_2 (Hz).
  * Must be achievable from the HMC7044 VCO by integer division.
  * 122.88 MHz: HMC7044 VCO = 22 x 122.88 = 2703.36 MHz,
- * CH_6 divider = 22, CH_12 (122.88 MHz) divider = 22.
+ * CH_2 divider = 22, CH_6/CH_12 (122.88 MHz) dividers = 22.
  * Override with -DLATTICE_AD9986_DEV_CLK_HZ=<Hz>. */
 #ifndef LATTICE_AD9986_DEV_CLK_HZ
 #define LATTICE_AD9986_DEV_CLK_HZ    122880000ULL

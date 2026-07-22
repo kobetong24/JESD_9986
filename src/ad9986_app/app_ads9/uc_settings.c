@@ -43,7 +43,8 @@ build a usecase parameters for a custom application.
 uint64_t clk_hz[][4] = {
     /*dev_ref,  fpga_ref, dac_clk,    adc_clk */   /* UC,   JESD,   Crystal type,       Lane rate,   Comments                  */
     { 122.88e6, 122.88e6, 5898.24e6,  2949.12e6 }, /* uc0,  nco test                                                           */
-    { 122.88e6, 737.28e6, 5898.24e6,  2949.12e6 }, /* uc1,  204B,   100MHz/122.88MHz    14.54560Gbps                           */
+    //{ 122.88e6, 737.28e6, 5898.24e6,  2949.12e6 }, /* uc1,  204B,   100MHz/122.88MHz    14.54560Gbps                           */
+    { 122.88e6, 122.88e6, 7864.32e6,  3932.16e6 },
     { 122.88e6, 737.28e6, 8847.36e6,  2949.12e6 }, /* uc2,  204B,   100MHz/122.88MHz,   14.54560Gbps                           */
     { 122.88e6, 368.64e6, 5898.24e6,  2949.12e6 }, /* uc3,  204B,   100MHz/122.88MHz,    7.37280Gbps                           */
     { 122.88e6, 368.64e6, 8847.36e6,  2949.12e6 }, /* uc4,  204B,   100MHz/122.88MHz,    7.37280Gbps                           */

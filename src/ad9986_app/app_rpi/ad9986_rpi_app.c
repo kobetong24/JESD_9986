@@ -461,7 +461,7 @@ static int32_t app_hmc7044_ch13_status(adi_hmc7044_device_t *dev)
     printf("    [7]   high_perform_en   = %d\n", (ctrl0 >> 7) & 1);
     printf("  CTRL_1 (0x014B) = 0x%02x  (divider[7:0])\n", ctrl1);
     printf("  CTRL_2 (0x014C) = 0x%02x  (divider[11:8])\n", ctrl2 & 0x0F);
-    printf("  Channel divider = %u  (expected 352 = 0x160 for 7.68 MHz from 2703.36 MHz VCO)\n",
+    printf("  Channel divider = %u  (expected 704 = 0x2C0: sysref_timer for SYSREF channels)\n",
            divider);
     printf("  CTRL_8 (0x0152) = 0x%02x  (driver: force_mute[7:6] drv_mode[4:3] impedance[1:0])\n",
            ctrl8);
@@ -470,14 +470,42 @@ static int32_t app_hmc7044_ch13_status(adi_hmc7044_device_t *dev)
     /* Summary */
     int ch_enabled    = (ctrl0 & 1);
     int startup_cont  = (((ctrl0 >> 2) & 3) == 0);
-    int divider_ok    = (divider == 352);
+    int divider_ok    = (divider == 704);
     int not_muted     = (((ctrl8 >> 6) & 3) == 0);
 
     printf("HMC7044 CH_13 SYSREF: %s\n",
            (ch_enabled && startup_cont && divider_ok && not_muted)
-           ? "UP AND RUNNING (enabled, continuous, divider=352, not muted)"
-           : "NOT RUNNING (see detail above)");
+           ? "UP AND RUNNING (enabled, continuous, divider=704, not muted)"
+           : "NOT RUNNING (see detail above -- use option 6 to clear force_mute)");
 
+    return API_CMS_ERROR_OK;
+}
+
+/* Unmute HMC7044 CH_13 SYSREF output.
+ *
+ * adi_hmc7044_clk_config() leaves CTRL_8 bits[7:6] = 0b10 (force_mute = always muted)
+ * on SYSREF channels.  Writing 0x00 to reg 0x0152 clears force_mute so the SYSREF
+ * signal reaches the FPGA JESD IP.  Call after app_hmc7044_clk_config(). */
+static int32_t app_hmc7044_ch13_unmute(adi_hmc7044_device_t *dev)
+{
+    int32_t err;
+    uint8_t ctrl8 = 0;
+
+    if (err = adi_hmc7044_device_spi_register_set(dev, 0x0152, 0x00), err != API_CMS_ERROR_OK) {
+        printf("HMC7044 CH_13: SPI write 0x0152 failed (%d).\n", err);
+        return err;
+    }
+    printf("HMC7044 CH_13: CTRL_8 (0x0152) written 0x00 (force_mute cleared).\n");
+
+    if (err = adi_hmc7044_device_spi_register_get(dev, 0x0152, &ctrl8), err != API_CMS_ERROR_OK) {
+        printf("HMC7044 CH_13: SPI read 0x0152 failed (%d).\n", err);
+        return err;
+    }
+    printf("HMC7044 CH_13: CTRL_8 readback = 0x%02x  force_mute = %d  %s\n",
+           ctrl8,
+           (ctrl8 >> 6) & 3,
+           ((ctrl8 >> 6) & 3) == 0 ? "(not muted -- output active)"
+                                   : "(still muted -- check SPI write path)");
     return API_CMS_ERROR_OK;
 }
 
@@ -844,7 +872,19 @@ int main(int argc, char *argv[])
         },
         .clk_info = {
             .sysref_mode = SYSREF_NONE,
-        }
+        },
+        .serdes_info = {
+            .des_settings = {
+                /* CTLE filter 1-4 (valid range); 2 = mid insertion-loss setting.
+                 * Required for QUART_RATE (JESD204C > 16 Gbps) deserializer path. */
+                .boost_mask  = 0xff,
+                .ctle_filter = { 2, 2, 2, 2, 2, 2, 2, 2 },
+                .lane_mapping = {
+                    { 0, 1, 2, 3, 4, 5, 6, 7 }, /* link0: physical lane i → logical lane i */
+                    { 4, 5, 6, 7, 0, 1, 2, 3 }, /* link1 (unused for single-link) */
+                },
+            },
+        },
     };
 
     /* HMC7044 on SPI1. */
@@ -939,9 +979,10 @@ int main(int argc, char *argv[])
             printf("  1 - Run JESD IP register verify\n");
             printf("  2 - Run JESD IP register read\n");
             printf("  3 - Check AD9986 JESD link status\n");
-            printf("  4 - Configure AD9986 JESD204C (UC15)\n");
+            printf("  4 - Configure AD9986 JESD204C (UC1 params, 7864.32 MHz clock)\n");
             printf("  5 - Check HMC7044 CH_13 SYSREF status\n");
-            printf("  6 - Exit\n");
+            printf("  6 - Unmute HMC7044 CH_13 SYSREF output (clear force_mute)\n");
+            printf("  7 - Exit\n");
             printf("Enter choice: ");
             if (scanf("%d", &user_choice) != 1) {
                 /* flush invalid input or exit on EOF */
@@ -949,7 +990,7 @@ int main(int argc, char *argv[])
                 if (feof(stdin))
                     break;
                 while ((c = getchar()) != '\n' && c != EOF);
-                printf("Invalid input. Please enter 1-6.\n");
+                printf("Invalid input. Please enter 1-7.\n");
                 continue;
             }
             if (user_choice == 1) {
@@ -963,9 +1004,11 @@ int main(int argc, char *argv[])
             } else if (user_choice == 5) {
                 app_hmc7044_ch13_status(&hmc7044_dev);
             } else if (user_choice == 6) {
+                app_hmc7044_ch13_unmute(&hmc7044_dev);
+            } else if (user_choice == 7) {
                 break;
             } else {
-                printf("Invalid choice. Please enter 1-6.\n");
+                printf("Invalid choice. Please enter 1-7.\n");
             }
         }
     }

@@ -864,36 +864,36 @@ restore:
 
 /* Configure the AD9986 for JESD204C using uc_settings.c array index 1 parameters.
  *
- * clk_hz[1]: dev_ref=122.88 MHz, DAC=7864.32 MHz, ADC=3932.16 MHz (unlabeled entry).
+ * clk_hz[1]: dev_ref=122.88 MHz, DAC=7864.32 MHz, ADC=3932.16 MHz.
  * JRX (FPGA→AD9986 DAC): jrx_param[1] with jesd_jesdv overridden to 2 (204C).
- *   4L 4F 8M 1S K=32 N=16, mode 9, main_interp=4, chan_interp=4, main_shift=1842.5 MHz.
- * JTX (AD9986 ADC→FPGA): jtx_param[1] with jesd_jesdv overridden to 2 (204C).
- *   4L 4F 8M 1S HD=1 K=32 N=16, mode 10, CDDC 0-3 DCM×2, FDDC 0/1/4/5 DCM×4. */
+ *   1L 8F 4M 1S K=32 N=16, mode 2, subclass=1, scr=0, main_interp=4, chan_interp=4.
+ * JTX (AD9986 ADC→FPGA): jtx_param[1][0] with jesd_jesdv overridden to 2 (204C).
+ *   1L 8F 4M 1S HD=0 K=32 N=16, mode 1, subclass=1, scr=0, CDDC 0-3 DCM×2, FDDC 0/1/4/5 DCM×4. */
 static int32_t app_ad9986_jesd204c_config(adi_ad9986_device_t *dev)
 {
     int32_t err;
 
-    /* jrx_param[1]: JESDV field overridden from 1 (204B) to 2 (204C). */
+    /* jrx_param[1]: values from uc_settings.c uc1 active row; jesdv overridden to 2 (204C). */
     adi_cms_jesd_param_t jrx_param = {
-        .jesd_l        = 4,  .jesd_f      = 4, .jesd_m   = 8,  .jesd_s    = 1,
+        .jesd_l        = 1,  .jesd_f      = 8, .jesd_m   = 4,  .jesd_s    = 1,
         .jesd_hd       = 0,  .jesd_k      = 32,
         .jesd_n        = 16, .jesd_np     = 16,
         .jesd_cf       = 0,  .jesd_cs     = 0,
         .jesd_did      = 0,  .jesd_bid    = 0,  .jesd_lid0 = 0,
-        .jesd_subclass = 0,  .jesd_scr    = 1,  .jesd_duallink = 0,
-        .jesd_jesdv    = 2,  .jesd_mode_id = 9,
+        .jesd_subclass = 1,  .jesd_scr    = 0,  .jesd_duallink = 0,
+        .jesd_jesdv    = 2,  .jesd_mode_id = 2,
     };
 
-    /* jtx_param[1]: JESDV field overridden from 1 (204B) to 2 (204C). */
+    /* jtx_param[1][0]: values from uc_settings.c uc1 active row; jesdv overridden to 2 (204C). */
     adi_cms_jesd_param_t jtx_param[2] = {
         {
-            .jesd_l        = 4,  .jesd_f      = 4, .jesd_m   = 8,  .jesd_s    = 1,
-            .jesd_hd       = 1,  .jesd_k      = 32,
+            .jesd_l        = 1,  .jesd_f      = 8, .jesd_m   = 4,  .jesd_s    = 1,
+            .jesd_hd       = 0,  .jesd_k      = 32,
             .jesd_n        = 16, .jesd_np     = 16,
             .jesd_cf       = 0,  .jesd_cs     = 0,
             .jesd_did      = 0,  .jesd_bid    = 0,  .jesd_lid0 = 0,
-            .jesd_subclass = 0,  .jesd_scr    = 1,  .jesd_duallink = 0,
-            .jesd_jesdv    = 2,  .jesd_mode_id = 10,
+            .jesd_subclass = 1,  .jesd_scr    = 0,  .jesd_duallink = 0,
+            .jesd_jesdv    = 2,  .jesd_mode_id = 1,
             .jesd_mode_c2r_en = 0, .jesd_mode_s_sel = 0,
         },
         { 0 }

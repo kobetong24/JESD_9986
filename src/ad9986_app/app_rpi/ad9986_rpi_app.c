@@ -360,13 +360,20 @@ static int32_t app_ad9986_link_status_check(adi_ad9986_device_t *dev)
         adi_ad9986_jesd_tx_link_select_set(dev, AD9986_LINK_0);
         adi_ad9986_hal_reg_get(dev, 0x0642, &jtx_l0_8);
 
-        uint8_t jrx_204b_en = (jrx_204b_reg >> 5) & 1;
-        uint8_t jrx_204c_en = (jrx_204c_reg >> 7) & 1;
-        uint8_t jtx_jesdv   = (jtx_l0_8   >> 5) & 7;
+        uint8_t jrx_204b_en  = (jrx_204b_reg >> 5) & 1;
+        uint8_t jrx_204c_en  = (jrx_204c_reg >> 7) & 1;
+        uint8_t jrx_055e_654 = (jrx_204c_reg >> 4) & 7;
+        uint8_t jtx_jesdv    = (jtx_l0_8    >> 5) & 7;
 
         printf("AD9986 JESD standard:\n");
-        printf("  JRX 204B enable (0x04C0[5]) = %d\n", jrx_204b_en);
-        printf("  JRX 204C enable (0x055E[7]) = %d\n", jrx_204c_en);
+        printf("  JRX 204B enable (0x04C0[5])   = %d\n", jrx_204b_en);
+        printf("  JRX 0x055E      (0x055E[7:4]) = 0x%02x\n", jrx_204c_reg & 0xF0);
+        printf("    [7] 204C enable              = %d\n", jrx_204c_en);
+        printf("    [6:4] bits                   = 0x%X  (0b%d%d%d)\n",
+               jrx_055e_654,
+               (jrx_055e_654 >> 2) & 1,
+               (jrx_055e_654 >> 1) & 1,
+               jrx_055e_654 & 1);
         printf("  JTX JESDV       (0x0642[7:5]) = %d  (%s)\n",
                jtx_jesdv,
                jtx_jesdv == 0 ? "204A" : jtx_jesdv == 1 ? "204B" : jtx_jesdv == 2 ? "204C" : "unknown");
@@ -402,6 +409,7 @@ static int32_t app_ad9986_link_status_check(adi_ad9986_device_t *dev)
         printf("  Deframer JRX_TPL_0     (0x04A0) = 0x%02x\n", jrx_tpl0);
         printf("    [2] jrx_tpl_sysref_rcvd        = %d\n", (jrx_tpl0 >> 2) & 1);
         printf("  Framer  JTX_TPL_6      (0x0636) = 0x%02x  [paged link0]\n", jtx_tpl6);
+        printf("    [0] bit0                        = %d\n", jtx_tpl6 & 1);
         printf("    [1] jtx_tpl_sysref_rcvd        = %d\n", (jtx_tpl6 >> 1) & 1);
         printf("    [2] jtx_tpl_sysref_phase_err   = %d\n", (jtx_tpl6 >> 2) & 1);
         printf("    [5] jtx_tpl_sysref_mask        = %d  (1=masked/subclass0)\n",

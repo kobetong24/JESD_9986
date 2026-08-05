@@ -282,12 +282,8 @@ int32_t adi_ads9_stop_transmit()
 
 int32_t adi_ads9_skip_rx_link_init_set(uint8_t value)
 {
-    uint32_t reg_val;
-    ads9_axi_reg_read32(0x106, &reg_val);    
-    reg_val = reg_val & (~(0x400));
-    reg_val = reg_val | (value << 10);
-    ads9_axi_reg_write32(0x106, reg_val);
-    return API_CMS_ERROR_OK;    
+    ads9_axi_reg_write32(0x106, (uint32_t)value << 10);
+    return API_CMS_ERROR_OK;
 }
 
 int32_t adi_ads9_capture_status_get(uint32_t *capture_complete, uint32_t *capture_state)
@@ -565,15 +561,11 @@ int32_t adi_ads9_write(uint8_t *data, int32_t data_size, adi_ads9_data_xfer_e *x
 
 int32_t adi_ads9_sysref_config(uint8_t sysref_src)
 {
-    uint32_t reg_val;
+    /* 0:Use SYSREF through FMC, 1:Use AD9528-generated or SMA sysref */
     if (sysref_src > 2) {
         return API_CMS_ERROR_INVALID_PARAM;
-        /* 0:Use SYSREF through FMC, 1:Use AD9528-generated or SMA sysref */
     }
-    ads9_axi_reg_read32(0x942, &reg_val);
-    reg_val = reg_val & (~(0x30000));
-    reg_val |= (sysref_src << 16);
-    ads9_axi_reg_write32(0x942, reg_val); 
+    ads9_axi_reg_write32(0x942, (uint32_t)sysref_src << 16);
     return API_CMS_ERROR_OK;
 }
 

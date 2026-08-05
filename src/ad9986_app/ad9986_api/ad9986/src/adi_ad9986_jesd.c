@@ -2090,10 +2090,6 @@ int32_t adi_ad9986_jesd_tx_link_status_get(adi_ad9986_device_t *device, adi_ad99
     /* log some other status for possible debug */
     err = adi_ad9986_hal_reg_get(device, 0x0636, &reg8); /* paged, jtx_tpl_6, bit0:jtx_tpl_invalid_cfg, bit1:jtx_tpl_sysref_rcvd */
     AD9986_ERROR_RETURN(err);
-    err = adi_ad9986_hal_reg_get(device, 0x0638, &reg8); /* paged, jtx_tpl_8, bit7~0:jtx_tpl_latency_added */
-    AD9986_ERROR_RETURN(err);
-    err = adi_ad9986_hal_reg_get(device, 0x0639, &reg8); /* paged, jtx_tpl_9, bit7~0:jtx_tpl_buf_frames */
-    AD9986_ERROR_RETURN(err);
     err = adi_ad9986_hal_reg_get(device, 0x0667, &reg8); /* paged, jtx_dl_204c_0, bit3:jtx_dl_204c_sysref_rcvd */
     AD9986_ERROR_RETURN(err);
 

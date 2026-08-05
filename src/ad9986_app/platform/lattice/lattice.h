@@ -185,10 +185,10 @@
 /*
  * GPIO character device and line offset used to drive the AD9986 RESETB pin.
  * On a Raspberry Pi 5 the 40-pin header GPIOs are usually exposed on
- * /dev/gpiochip4 (RP1). Set these to match the RESETB net wiring.
+ * /dev/gpiochip15 (RP1). Set these to match the RESETB net wiring.
  */
 #ifndef LATTICE_RESETB_CHIP
-#define LATTICE_RESETB_CHIP      "/dev/gpiochip4"
+#define LATTICE_RESETB_CHIP      "/dev/gpiochip15"
 #endif
 #ifndef LATTICE_RESETB_LINE
 #define LATTICE_RESETB_LINE      25u

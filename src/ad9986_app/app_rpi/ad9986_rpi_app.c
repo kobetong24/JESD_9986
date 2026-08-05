@@ -34,6 +34,54 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Forward declarations for JESD functions not yet exposed in a header */
+int32_t adi_ad9986_jesd_rx_bit_rate_get(adi_ad9986_device_t *device, uint64_t *bit_rate_bps);
+int32_t adi_ad9986_jesd_tx_bit_rate_get(adi_ad9986_device_t *device, adi_ad9986_jesd_link_select_e link, uint64_t *bit_rate_bps);
+int32_t adi_ad9986_jesd_tx_gen_test(adi_ad9986_device_t *device, adi_ad9986_jesd_link_select_e links, adi_ad9986_jesd_tx_test_data_src_e data_source, adi_ad9986_jesd_tx_test_mode_e test_mode);
+
+/* Use-case parameter tables defined in uc_settings.c.  The Raspberry Pi
+ * control-plane app drives a single JESD204C use case; all datapath and link
+ * parameters are read directly from index AD9986_UC_INDEX of these tables
+ * (rather than being duplicated as local literals in this file). */
+#define AD9986_UC_INDEX 1
+extern uint8_t                   tx_dac_chan_xbar[][4];
+extern int64_t                   tx_main_shift[][4];
+extern int64_t                   tx_chan_shift[][8];
+extern uint8_t                   tx_interp[][2];
+extern uint8_t                   rx_cddc_select[];
+extern int64_t                   rx_cddc_shift[][4];
+extern uint8_t                   rx_cddc_dcm[][4];
+extern uint8_t                   rx_cddc_c2r[][4];
+extern uint8_t                   rx_fddc_select[];
+extern int64_t                   rx_fddc_shift[][8];
+extern uint8_t                   rx_fddc_dcm[][8];
+extern uint8_t                   rx_fddc_c2r[8];
+extern adi_ad9986_jtx_conv_sel_t jtx_conv_sel[][2];
+extern adi_cms_jesd_param_t      jrx_param[];
+extern adi_cms_jesd_param_t      jtx_param[][2];
+
+/* Standardized register/status print: offset, symbol, raw value, decoded fields. */
+static void app_reg_print_u8(uint32_t off, const char *name, uint8_t val, const char *decode)
+{
+    printf("  0x%04X  %-32s  val=0x%02X  %s\n",
+           (unsigned)off, name, (unsigned)val, decode ? decode : "");
+}
+
+static void app_reg_print_u16(uint32_t off, const char *name, uint16_t val, const char *decode)
+{
+    printf("  0x%04X  %-32s  val=0x%04X  %s\n",
+           (unsigned)off, name, (unsigned)val, decode ? decode : "");
+}
+
+static void app_reg_print_u32(uint32_t off, const char *name, uint32_t val, const char *decode)
+{
+    printf("  0x%04X  %-32s  val=0x%08X  %s\n",
+           (unsigned)off, name, (unsigned)val, decode ? decode : "");
+}
+
+/* Serialises SPI bus access between the PLL monitor thread, PRBS loop, and main menu. */
+static pthread_mutex_t g_spi_mtx = PTHREAD_MUTEX_INITIALIZER;
+
 /*============= C O D E ====================*/
 static int32_t app_jesd_ip_reg_write(uint32_t addr, uint32_t data)
 {
@@ -43,7 +91,7 @@ static int32_t app_jesd_ip_reg_write(uint32_t addr, uint32_t data)
         printf("JESD IP: write addr=0x%04x failed (%d).\n", addr, err);
         return err;
     }
-    printf("JESD IP: write addr=0x%04x  data=0x%08x\n", addr, data);
+    app_reg_print_u32(addr, "FPGA_JESD_IP", data, "SPI write");
     return API_CMS_ERROR_OK;
 }
 
@@ -58,7 +106,7 @@ static int32_t app_jesd_ip_reg_read(uint32_t addr, uint32_t *data)
         printf("JESD IP: read  addr=0x%04x failed (%d).\n", addr, err);
         return err;
     }
-    printf("JESD IP: read  addr=0x%04x  data=0x%08x\n", addr, *data);
+    app_reg_print_u32(addr, "FPGA_JESD_IP", *data, "SPI read");
     return API_CMS_ERROR_OK;
 }
 
@@ -148,8 +196,15 @@ static int32_t app_ad9986_identify(adi_ad9986_device_t *dev)
         printf("AD9986: chip id read failed (%d) -- check SPI0 CS1 / Lattice proxy wiring.\n", err);
         return err;
     }
-    printf("AD9986 chip type 0x%02x, product id 0x%04x, revision 0x%02x\n",
-           chip_id.chip_type, chip_id.prod_id, chip_id.dev_revision);
+    {
+        char dec[64];
+        app_reg_print_u8(0x0003, "REG_CHIP_TYPE", chip_id.chip_type,
+                         "[7:0]=BF_CHIP_TYPE");
+        snprintf(dec, sizeof(dec), "[15:0]=BF_PROD_ID=0x%04X", chip_id.prod_id);
+        app_reg_print_u16(0x0004, "REG_PROD_ID_LSB/MSB", chip_id.prod_id, dec);
+        snprintf(dec, sizeof(dec), "[3:0]=BF_CHIP_GRADE=%u", chip_id.dev_revision);
+        app_reg_print_u8(0x0006, "REG_CHIP_GRADE", chip_id.dev_revision, dec);
+    }
     return API_CMS_ERROR_OK;
 }
 
@@ -167,8 +222,18 @@ static int32_t app_hmc7044_identify(adi_hmc7044_device_t *dev)
         printf("HMC7044: chip id read failed (%d) -- check SPI1 wiring.\n", err);
         return err;
     }
-    printf("HMC7044 chip type 0x%02x, product id 0x%04x, revision 0x%02x\n",
-           chip_id.chip_type, chip_id.prod_id, chip_id.dev_revision);
+    {
+        char dec[64];
+        uint8_t r78 = 0, r79 = 0, r7a = 0;
+        adi_hmc7044_device_spi_register_get(dev, 0x0078, &r78);
+        adi_hmc7044_device_spi_register_get(dev, 0x0079, &r79);
+        adi_hmc7044_device_spi_register_get(dev, 0x007A, &r7a);
+        app_reg_print_u8(0x0078, "HMC7044_CHIP_ID_0", r78, "[7:0]=dev_revision");
+        snprintf(dec, sizeof(dec), "[7:0]=prod_id[7:0]=0x%02X", r79);
+        app_reg_print_u8(0x0079, "HMC7044_CHIP_ID_1", r79, dec);
+        snprintf(dec, sizeof(dec), "[7:0]=prod_id[15:8]=0x%02X  prod_id=0x%04X", r7a, chip_id.prod_id);
+        app_reg_print_u8(0x007A, "HMC7044_CHIP_ID_2", r7a, dec);
+    }
 
     /* Validate the read-back. A product id of 0x0000 (idle-low data line) or
      * 0xFFFF (floating-high / no driver) means the HMC7044 is not responding:
@@ -214,16 +279,44 @@ static int32_t app_hmc7044_pll_lock_check(adi_hmc7044_device_t *dev)
         printf("HMC7044: PLL lock status read failed (%d).\n", err);
         return err;
     }
-    printf("HMC7044: PLL lock status 0x%02x  PLL1=%s  PLL2=%s\n",
-           status,
-           (status & HMC7044_PLL1_LOCK_ST) ? "LOCKED" : "NOT LOCKED",
-           (status & HMC7044_PLL2_LOCK_ST) ? "LOCKED" : "NOT LOCKED");
+    {
+        char dec[96];
+        uint8_t r7c = 0, r7d = 0;
+        adi_hmc7044_device_spi_register_get(dev, 0x007C, &r7c);
+        adi_hmc7044_device_spi_register_get(dev, 0x007D, &r7d);
+        snprintf(dec, sizeof(dec), "[5]=PLL1_lock=%u  API=%s",
+                 (r7c >> 5) & 1, (status & HMC7044_PLL1_LOCK_ST) ? "LOCKED" : "NOT LOCKED");
+        app_reg_print_u8(0x007C, "HMC7044_PLL1_STATUS", r7c, dec);
+        snprintf(dec, sizeof(dec), "[0]=PLL2_lock=%u  API=%s",
+                 r7d & 1, (status & HMC7044_PLL2_LOCK_ST) ? "LOCKED" : "NOT LOCKED");
+        app_reg_print_u8(0x007D, "HMC7044_PLL2_STATUS", r7d, dec);
+    }
     if (!(status & HMC7044_PLL1_AND_PLL2_LOCK_ST)) {
         printf("HMC7044: PLL not fully locked -- call adi_hmc7044_clk_config() first.\n");
         return API_CMS_ERROR_TEST_FAILED;
     }
     printf("HMC7044: PLL locked OK.\n");
     return API_CMS_ERROR_OK;
+}
+
+/* Read and print HMC7044 PLL lock status (SPI1 CS0). */
+static void app_hmc7044_reg_dump(adi_hmc7044_device_t *dev)
+{
+    char dec[160];
+
+    printf("\n=== HMC7044 register dump (SPI1 CS0) ===\n");
+    {
+        uint8_t r7c = 0, r7d = 0, pll_st = 0;
+        adi_hmc7044_device_pll_lock_status_get(dev, &pll_st);
+        adi_hmc7044_device_spi_register_get(dev, 0x007C, &r7c);
+        adi_hmc7044_device_spi_register_get(dev, 0x007D, &r7d);
+        snprintf(dec, sizeof(dec), "[5]=PLL1_lock=%u  API=%s",
+                 (r7c >> 5) & 1, (pll_st & HMC7044_PLL1_LOCK_ST) ? "LOCKED" : "NOT LOCKED");
+        app_reg_print_u8(0x007C, "HMC7044_PLL1_STATUS", r7c, dec);
+        snprintf(dec, sizeof(dec), "[0]=PLL2_lock=%u  API=%s",
+                 r7d & 1, (pll_st & HMC7044_PLL2_LOCK_ST) ? "LOCKED" : "NOT LOCKED");
+        app_reg_print_u8(0x007D, "HMC7044_PLL2_STATUS", r7d, dec);
+    }
 }
 
 /* Configure the AD9986 on-chip clock PLL.
@@ -268,10 +361,13 @@ static int32_t app_ad9986_clk_pll_lock_check(adi_ad9986_device_t *dev)
         printf("AD9986: clock PLL lock status read failed (%d).\n", err);
         return err;
     }
-    printf("AD9986: clock PLL lock status 0x%02x  FAST=%s  SLOW=%s\n",
-           status,
-           (status & 0x1) ? "LOCKED" : "NOT LOCKED",
-           (status & 0x2) ? "LOCKED" : "NOT LOCKED");
+    {
+        char dec[96];
+        snprintf(dec, sizeof(dec), "[0]=BF_PLL_LOCK_SLOW=%s  [1]=BF_PLL_LOCK_FAST=%s",
+                 (status & 0x1) ? "LOCKED" : "NOT LOCKED",
+                 (status & 0x2) ? "LOCKED" : "NOT LOCKED");
+        app_reg_print_u8(0x2008, "REG_CLK_PLL_STATUS", status, dec);
+    }
     if (status != 0x3) {
         printf("AD9986: clock PLL not fully locked -- check device clock input.\n");
         return API_CMS_ERROR_TEST_FAILED;
@@ -286,14 +382,19 @@ static int32_t app_ad9986_clk_pll_lock_check(adi_ad9986_device_t *dev)
 static int32_t __attribute__((unused)) app_ad9986_jesd_pll_lock_check(adi_ad9986_device_t *dev)
 {
     int32_t err;
-    uint8_t status = 0;
+    uint8_t status = 0, r0722 = 0;
 
     if (err = adi_ad9986_jesd_pll_lock_status_get(dev, &status), err != API_CMS_ERROR_OK) {
         printf("AD9986: JESD PLL lock status read failed (%d).\n", err);
         return err;
     }
-    printf("AD9986: JESD PLL lock status 0x%02x  %s\n",
-           status, status ? "LOCKED" : "NOT LOCKED");
+    adi_ad9986_hal_reg_get(dev, 0x0722, &r0722);
+    {
+        char dec[64];
+        snprintf(dec, sizeof(dec), "[3]=BF_RFPLLLOCK_LCPLL_RS=%u  %s",
+                 (r0722 >> 3) & 1, status ? "LOCKED" : "NOT LOCKED");
+        app_reg_print_u8(0x0722, "REG_PLL_STATUS_LCPLL", r0722, dec);
+    }
     if (!status) {
         printf("AD9986: JESD SerDes PLL not locked -- check lane rate / JESD clock.\n");
         return API_CMS_ERROR_TEST_FAILED;
@@ -304,121 +405,354 @@ static int32_t __attribute__((unused)) app_ad9986_jesd_pll_lock_check(adi_ad9986
 
 /* Query and print JESD204 link status for both JRX (DAC path) and JTX (ADC path).
  * Can be called any time after clock bring-up; results are only meaningful once
- * the JESD link has been configured and enabled. */
-static int32_t app_ad9986_link_status_check(adi_ad9986_device_t *dev)
+ * the JESD link has been configured and enabled.
+ *
+ * Output is organised in two sections:
+ *   1. AD9986 register dump (SPI0 CS1), ascending address, 204C-focused
+ *   2. HMC7044 register dump (SPI1 CS0)
+ */
+static int32_t app_ad9986_link_status_check(adi_ad9986_device_t *dev,
+                                            adi_hmc7044_device_t *hmc)
 {
     int32_t  err;
-    uint8_t  jesd_pll = 0;
-    uint16_t jrx_st   = 0;
-    uint16_t jtx_st   = 0;
-    int      i;
+    char     dec[160];
 
-    /* SerDes PLL */
+    uint8_t  jesd_pll = 0;
+    uint8_t  r0722 = 0;
+    uint8_t  r01FE = 0, r01FF = 0;
+    uint8_t  r0289 = 0;
+    uint8_t  r04A0 = 0;
+    uint8_t  r04A9 = 0, r04AA = 0, r04AB = 0, r04AC = 0;
+    uint8_t  r04AD = 0, r04AE = 0, r04AF = 0, r04B0 = 0;
+    uint8_t  r055E = 0, r05BB = 0;
+    uint8_t  r0636 = 0;
+    uint8_t  r063D = 0, r063E = 0, r063F = 0, r0640 = 0;
+    uint8_t  r0641 = 0, r0642 = 0, r0643 = 0, r0644 = 0;
+    uint8_t  r0667 = 0, r0668 = 0;
+    uint8_t  r0701 = 0, r0711 = 0, r0713 = 0;
+    uint8_t  r00B8 = 0;
+    uint16_t sysref_phase = 0;
+    uint8_t  sysref_sync_done = 0;
+    uint8_t  jrx_cfg_valid = 0;
+    uint8_t  irq_st = 0;
+
+    /* ------------------------------------------------------------------ */
+    /* Register reads (API + direct)                                         */
+    /* ------------------------------------------------------------------ */
     if (err = adi_ad9986_jesd_pll_lock_status_get(dev, &jesd_pll), err != API_CMS_ERROR_OK) {
         printf("AD9986: JESD SerDes PLL read failed (%d).\n", err);
         return err;
     }
-    printf("AD9986 JESD SerDes PLL : %s\n", jesd_pll ? "LOCKED" : "NOT LOCKED");
 
-    /* JRX (DAC / Rx link: FPGA → AD9986) */
-    if (err = adi_ad9986_jesd_rx_link_status_get(dev, AD9986_LINK_0, &jrx_st), err != API_CMS_ERROR_OK) {
-        printf("AD9986: JRX link status read failed (%d).\n", err);
-        return err;
-    }
-    printf("AD9986 JRX link 0 (DAC path):\n");
-    printf("  204C state : %d %s\n", (jrx_st >> 8) & 0xFF,
-           ((jrx_st >> 8) & 0xFF) == 6 ? "(link up)" : "(link down)");
-    printf("  Lane status: 0x%02x  ", jrx_st & 0xFF);
-    for (i = 0; i < 8; i++)
-        printf("L%d:%s ", i, (jrx_st >> i) & 1 ? "UP" : "DN");
-    printf("\n");
+    adi_ad9986_hal_reg_get(dev, 0x01FE, &r01FE);
+    adi_ad9986_hal_reg_get(dev, 0x01FF, &r01FF);
+    adi_ad9986_hal_reg_get(dev, 0x00B8, &r00B8);
+    adi_ad9986_jesd_sysref_monitor_phase_get(dev, &sysref_phase);
+    adi_ad9986_jesd_sysref_oneshot_sync_done_get(dev, &sysref_sync_done);
 
-    /* JTX (ADC / Tx link: AD9986 → FPGA) */
-    if (err = adi_ad9986_jesd_tx_link_status_get(dev, AD9986_LINK_0, &jtx_st), err != API_CMS_ERROR_OK) {
-        printf("AD9986: JTX link status read failed (%d).\n", err);
-        return err;
-    }
-    printf("AD9986 JTX link 0 (ADC path):\n");
-    printf("  QBF state       : 0x%X\n",  jtx_st & 0x0F);
-    printf("  Frame sync      : %s\n",    (jtx_st >> 4) & 1 ? "OK"     : "NO SYNC");
-    printf("  SerDes PLL      : %s\n",    (jtx_st >> 5) & 1 ? "LOCKED" : "NOT LOCKED");
-    printf("  Phase estab.    : %s\n",    (jtx_st >> 6) & 1 ? "YES"    : "NO");
-    printf("  Invalid mode    : %s\n",    (jtx_st >> 7) & 1 ? "YES (error)" : "NO (ok)");
+    adi_ad9986_jesd_tx_link_select_set(dev, AD9986_LINK_0);
+    adi_ad9986_hal_reg_get(dev, 0x0289, &r0289);
 
-    /* JESD standard mode check.
-     * JRX (DAC path, not paged):
-     *   0x04C0 bit5 = jrx_dl_204b_enable
-     *   0x055E bit7 = jrx_dl_204c_enable
-     * JTX (ADC path, paged – link 0 already selected above):
-     *   0x0642 bits[7:5] = jtx_jesdv_cfg  (0=204A, 1=204B, 2=204C) */
+    adi_ad9986_jesd_rx_link_select_set(dev, AD9986_LINK_0);
+    adi_ad9986_hal_reg_get(dev, 0x04A0, &r04A0);
+    adi_ad9986_hal_reg_get(dev, 0x04A9, &r04A9);
+    adi_ad9986_hal_reg_get(dev, 0x04AA, &r04AA);
+    adi_ad9986_hal_reg_get(dev, 0x04AB, &r04AB);
+    adi_ad9986_hal_reg_get(dev, 0x04AC, &r04AC);
+    adi_ad9986_hal_reg_get(dev, 0x04AD, &r04AD);
+    adi_ad9986_hal_reg_get(dev, 0x04AE, &r04AE);
+    adi_ad9986_hal_reg_get(dev, 0x04AF, &r04AF);
+    adi_ad9986_hal_reg_get(dev, 0x04B0, &r04B0);
+    adi_ad9986_hal_reg_get(dev, 0x055E, &r055E);
+    adi_ad9986_hal_reg_get(dev, 0x05BB, &r05BB);
+
+    adi_ad9986_jesd_rx_config_status_get(dev, &jrx_cfg_valid);
+    adi_ad9986_jesd_rx_204c_crc_irq_status_get(dev, AD9986_LINK_0, &irq_st);
+    adi_ad9986_jesd_rx_204c_crc_irq_clr(dev, AD9986_LINK_0);
+    adi_ad9986_jesd_rx_204c_mb_irq_status_get(dev, AD9986_LINK_0, &irq_st);
+    adi_ad9986_jesd_rx_204c_mb_irq_clr(dev, AD9986_LINK_0);
+    adi_ad9986_jesd_rx_204c_sh_irq_status_get(dev, AD9986_LINK_0, &irq_st);
+    adi_ad9986_jesd_rx_204c_sh_irq_clr(dev, AD9986_LINK_0);
+
+    adi_ad9986_jesd_tx_link_select_set(dev, AD9986_LINK_0);
+    adi_ad9986_hal_reg_get(dev, 0x0636, &r0636);
+    adi_ad9986_hal_reg_get(dev, 0x063D, &r063D);
+    adi_ad9986_hal_reg_get(dev, 0x063E, &r063E);
+    adi_ad9986_hal_reg_get(dev, 0x063F, &r063F);
+    adi_ad9986_hal_reg_get(dev, 0x0640, &r0640);
+    adi_ad9986_hal_reg_get(dev, 0x0641, &r0641);
+    adi_ad9986_hal_reg_get(dev, 0x0642, &r0642);
+    adi_ad9986_hal_reg_get(dev, 0x0643, &r0643);
+    adi_ad9986_hal_reg_get(dev, 0x0644, &r0644);
+    adi_ad9986_hal_reg_get(dev, 0x0667, &r0667);
+    adi_ad9986_hal_reg_get(dev, 0x0668, &r0668);
+
+    adi_ad9986_hal_reg_get(dev, 0x0701, &r0701);
+    adi_ad9986_hal_reg_get(dev, 0x0711, &r0711);
+    adi_ad9986_hal_reg_get(dev, 0x0713, &r0713);
+    adi_ad9986_hal_reg_get(dev, 0x0722, &r0722);
+
+    /* ------------------------------------------------------------------ */
+    /* Section 1 — AD9986 register dump (SPI0 CS1), ascending address      */
+    /* ------------------------------------------------------------------ */
+    printf("\n=== AD9986 register dump (SPI0 CS1) ===\n");
+
+    printf("  [SYSREF monitor — not paged]\n");
+    snprintf(dec, sizeof(dec),
+             "[12:0]=BF_SYSREF_PHASE=0x%04X  (API read of 0x00B5/0x00B6)",
+             sysref_phase);
+    app_reg_print_u16(0x00B5, "REG_SYSREF_PHASE0/1", sysref_phase, dec);
+    snprintf(dec, sizeof(dec), "[4]=BF_ONESHOT_SYNC_DONE=%u", sysref_sync_done);
+    app_reg_print_u8(0x00B8, "REG_SYSREF_MODE", r00B8, dec);
+
+    printf("  [JESD mode / datapath — not paged]\n");
+    snprintf(dec, sizeof(dec),
+             "[5:0]=BF_TX_JESD_MODE=%u  [7]=BF_MODE_NOT_IN_TABLE=%u  (0=OK, 1=mismatch)",
+             r01FE & 0x3F, jrx_cfg_valid);
+    app_reg_print_u8(0x01FE, "REG_JESD_MODE", r01FE, dec);
+    snprintf(dec, sizeof(dec),
+             "[7:4]=BF_FINE_INTERP_SEL=%u  [3:0]=BF_COARSE_INTERP_SEL=%u  product=%u",
+             (r01FF >> 4) & 0x0F, r01FF & 0x0F,
+             ((r01FF >> 4) & 0x0F) * (r01FF & 0x0F));
+    app_reg_print_u8(0x01FF, "REG_INTRP_MODE", r01FF, dec);
+
+    printf("  [JTX framer — paged link0]\n");
+    snprintf(dec, sizeof(dec),
+             "[7:0]=BF_CHIP_DECIMATION_RATIO=%u  (expect DCM=8 for UC1)", r0289 & 0xFF);
+    app_reg_print_u8(0x0289, "REG_CHIP_DECIMATION_RATIO", r0289, dec);
+
+    printf("  [JRX deframer — paged link0]\n");
+    snprintf(dec, sizeof(dec), "[0]=%u  [2]=BF_JRX_TPL_SYSREF_RCVD=%u",
+             r04A0 & 1, (r04A0 >> 2) & 1);
+    app_reg_print_u8(0x04A0, "REG_JRX_TPL_0", r04A0, dec);
+    snprintf(dec, sizeof(dec),
+             "[4:0]=BF_JRX_L_CFG=%u(L=%u)  [7]=BF_JRX_DSCR_CFG=%u  (expect L=1)",
+             r04A9 & 0x1F, (r04A9 & 0x1F) + 1, (r04A9 >> 7) & 1);
+    app_reg_print_u8(0x04A9, "REG_JRX_L0_3", r04A9, dec);
+    snprintf(dec, sizeof(dec), "[7:0]=BF_JRX_F_CFG=%u(F=%u)  (expect F=4)",
+             r04AA & 0xFF, (r04AA & 0xFF) + 1);
+    app_reg_print_u8(0x04AA, "REG_JRX_L0_4", r04AA, dec);
+    snprintf(dec, sizeof(dec), "[7:0]=BF_JRX_K_CFG=%u(K=%u)  (expect K=64)",
+             r04AB & 0xFF, (r04AB & 0xFF) + 1);
+    app_reg_print_u8(0x04AB, "REG_JRX_L0_5", r04AB, dec);
+    snprintf(dec, sizeof(dec), "[7:0]=BF_JRX_M_CFG=%u(M=%u)  (expect M=2)",
+             r04AC & 0xFF, (r04AC & 0xFF) + 1);
+    app_reg_print_u8(0x04AC, "REG_JRX_L0_6", r04AC, dec);
+    snprintf(dec, sizeof(dec), "[4:0]=BF_JRX_N_CFG=%u(N=%u)  (expect N=16)",
+             r04AD & 0x1F, (r04AD & 0x1F) + 1);
+    app_reg_print_u8(0x04AD, "REG_JRX_L0_7", r04AD, dec);
+    snprintf(dec, sizeof(dec),
+             "[4:0]=BF_JRX_NP_CFG=%u(Np=%u)  [7:5]=BF_JRX_SUBCLASSV_CFG=%u  (expect Np=16 sub=1)",
+             r04AE & 0x1F, (r04AE & 0x1F) + 1, (r04AE >> 5) & 7);
+    app_reg_print_u8(0x04AE, "REG_JRX_L0_8", r04AE, dec);
+    snprintf(dec, sizeof(dec),
+             "[4:0]=BF_JRX_S_CFG=%u(S=%u)  [7:5]=BF_JRX_JESDV_CFG=%u  (expect S=1 jesdv=2)",
+             r04AF & 0x1F, (r04AF & 0x1F) + 1, (r04AF >> 5) & 7);
+    app_reg_print_u8(0x04AF, "REG_JRX_L0_9", r04AF, dec);
+    snprintf(dec, sizeof(dec), "[7]=BF_JRX_HD_CFG=%u  (expect HD=0)", (r04B0 >> 7) & 1);
+    app_reg_print_u8(0x04B0, "REG_JRX_L0_10", r04B0, dec);
+
+    printf("  [JRX deframer — 204C link state, paged link0]\n");
+    snprintf(dec, sizeof(dec),
+             "[7]=BF_JRX_DL_204C_ENABLE=%u  [6:4]=BF_JRX_DL_204C_STATE=%u  %s  (expect en=1)",
+             (r055E >> 7) & 1, (r055E >> 4) & 7,
+             ((r055E >> 4) & 7) == 6 ? "(link up)" : "(link down)");
+    app_reg_print_u8(0x055E, "REG_JRX_DL_204C_0", r055E, dec);
     {
-        uint8_t jrx_204b_reg = 0, jrx_204c_reg = 0, jtx_l0_8 = 0;
+        uint32_t K = (r04AB & 0xFF) + 1, F = (r04AA & 0xFF) + 1;
+        uint32_t E = (K * F) / 256;
+        printf("  (derived)   E (JRX, K*F/256)            K=%u F=%u => E=%u  (expect E=1)\n",
+               K, F, E < 1 ? 1 : E);
+    }
 
-        adi_ad9986_hal_reg_get(dev, 0x04C0, &jrx_204b_reg);
-        adi_ad9986_hal_reg_get(dev, 0x055E, &jrx_204c_reg);
+    printf("  [JRX deframer — 204C error IRQ, paged link0]\n");
+    snprintf(dec, sizeof(dec),
+             "[3]=BF_JRX_204C_CRC_IRQ=%u  [4]=BF_JRX_204C_MB_IRQ=%u  [5]=BF_JRX_204C_SH_IRQ=%u"
+             "  (latched, cleared after read)",
+             (r05BB >> 3) & 1, (r05BB >> 4) & 1, (r05BB >> 5) & 1);
+    app_reg_print_u8(0x05BB, "REG_JRX_204C_IRQ", r05BB, dec);
 
-        adi_ad9986_jesd_tx_link_select_set(dev, AD9986_LINK_0);
-        adi_ad9986_hal_reg_get(dev, 0x0642, &jtx_l0_8);
+    printf("  [JTX framer — paged link0, continued]\n");
+    snprintf(dec, sizeof(dec),
+             "[0]=BF_JTX_TPL_INVALID_CFG=%u  [1]=BF_JTX_TPL_SYSREF_RCVD=%u"
+             "  [2]=BF_JTX_TPL_SYSREF_PHASE_ERR=%u  [5]=BF_JTX_TPL_SYSREF_MASK=%u",
+             r0636 & 1, (r0636 >> 1) & 1, (r0636 >> 2) & 1, (r0636 >> 5) & 1);
+    app_reg_print_u8(0x0636, "REG_JTX_TPL_6", r0636, dec);
+    snprintf(dec, sizeof(dec),
+             "[4:0]=BF_JTX_L_CFG=%u(L=%u)  [7]=BF_JTX_SCR_CFG=%u  (expect L=1)",
+             r063D & 0x1F, (r063D & 0x1F) + 1, (r063D >> 7) & 1);
+    app_reg_print_u8(0x063D, "REG_JTX_L0_3", r063D, dec);
+    snprintf(dec, sizeof(dec), "[7:0]=BF_JTX_F_CFG=%u(F=%u)  (expect F=4)",
+             r063E & 0xFF, (r063E & 0xFF) + 1);
+    app_reg_print_u8(0x063E, "REG_JTX_L0_4", r063E, dec);
+    snprintf(dec, sizeof(dec), "[7:0]=BF_JTX_K_CFG=%u(K=%u)  (expect K=64)",
+             r063F & 0xFF, (r063F & 0xFF) + 1);
+    app_reg_print_u8(0x063F, "REG_JTX_L0_5", r063F, dec);
+    snprintf(dec, sizeof(dec), "[7:0]=BF_JTX_M_CFG=%u(M=%u)  (expect M=2)",
+             r0640 & 0xFF, (r0640 & 0xFF) + 1);
+    app_reg_print_u8(0x0640, "REG_JTX_L0_6", r0640, dec);
+    snprintf(dec, sizeof(dec),
+             "[4:0]=BF_JTX_N_CFG=%u(N=%u)  [7:6]=BF_JTX_CS_CFG=%u  (expect N=16)",
+             r0641 & 0x1F, (r0641 & 0x1F) + 1, (r0641 >> 6) & 3);
+    app_reg_print_u8(0x0641, "REG_JTX_L0_7", r0641, dec);
+    snprintf(dec, sizeof(dec),
+             "[4:0]=BF_JTX_NP_CFG=%u(Np=%u)  [7:5]=BF_JTX_SUBCLASSV_CFG=%u  (expect Np=16 sub=1)",
+             r0642 & 0x1F, (r0642 & 0x1F) + 1, (r0642 >> 5) & 7);
+    app_reg_print_u8(0x0642, "REG_JTX_L0_8", r0642, dec);
+    snprintf(dec, sizeof(dec),
+             "[4:0]=BF_JTX_S_CFG=%u(S=%u)  [7:5]=BF_JTX_JESDV_CFG=%u  (expect S=1 jesdv=2)",
+             r0643 & 0x1F, (r0643 & 0x1F) + 1, (r0643 >> 5) & 7);
+    app_reg_print_u8(0x0643, "REG_JTX_L0_9", r0643, dec);
+    snprintf(dec, sizeof(dec), "[7]=BF_JTX_HD_CFG=%u  (expect HD=0)", (r0644 >> 7) & 1);
+    app_reg_print_u8(0x0644, "REG_JTX_L0_10", r0644, dec);
+    snprintf(dec, sizeof(dec), "[3]=BF_JTX_DL_204C_SYSREF_RCVD=%u", (r0667 >> 3) & 1);
+    app_reg_print_u8(0x0667, "REG_JTX_DL_204C_0", r0667, dec);
+    snprintf(dec, sizeof(dec),
+             "[7:0]=BF_JTX_E_CFG=%u(E=%u)  (expect E=1 for UC1)",
+             r0668 & 0xFF, (r0668 & 0xFF) + 1);
+    app_reg_print_u8(0x0668, "REG_JTX_DL_204C_1", r0668, dec);
 
-        uint8_t jrx_204b_en  = (jrx_204b_reg >> 5) & 1;
-        uint8_t jrx_204c_en  = (jrx_204c_reg >> 7) & 1;
-        uint8_t jrx_055e_654 = (jrx_204c_reg >> 4) & 7;
-        uint8_t jtx_jesdv    = (jtx_l0_8    >> 5) & 7;
+    printf("  [JTX framer — not paged]\n");
+    snprintf(dec, sizeof(dec), "[7]=BF_JTX_PLL_LOCKED=%u  %s",
+             (r0701 >> 7) & 1, ((r0701 >> 7) & 1) ? "LOCKED" : "NOT LOCKED");
+    app_reg_print_u8(0x0701, "REG_PLL_STATUS", r0701, dec);
+    snprintf(dec, sizeof(dec), "[0]=BF_JTX_INVALID_MODE=%u  %s",
+             r0711 & 1, (r0711 & 1) ? "YES (error)" : "NO (ok)");
+    app_reg_print_u8(0x0711, "REG_QC_MODE_STATUS", r0711, dec);
+    snprintf(dec, sizeof(dec), "[0]=BF_JTX_PHASE_ESTABLISHED=%u  %s",
+             r0713 & 1, (r0713 & 1) ? "YES" : "NO");
+    app_reg_print_u8(0x0713, "REG_PHASE_ESTABLISH_STATUS", r0713, dec);
 
-        printf("AD9986 JESD standard:\n");
-        printf("  JRX 204B enable (0x04C0[5])   = %d\n", jrx_204b_en);
-        printf("  JRX 0x055E      (0x055E[7:4]) = 0x%02x\n", jrx_204c_reg & 0xF0);
-        printf("    [7] 204C enable              = %d\n", jrx_204c_en);
-        printf("    [6:4] bits                   = 0x%X  (0b%d%d%d)\n",
-               jrx_055e_654,
-               (jrx_055e_654 >> 2) & 1,
-               (jrx_055e_654 >> 1) & 1,
-               jrx_055e_654 & 1);
-        printf("  JTX JESDV       (0x0642[7:5]) = %d  (%s)\n",
-               jtx_jesdv,
-               jtx_jesdv == 0 ? "204A" : jtx_jesdv == 1 ? "204B" : jtx_jesdv == 2 ? "204C" : "unknown");
-        if (jrx_204b_en && !jrx_204c_en)
-            printf("  => JRX configured for JESD204B\n");
-        else if (!jrx_204b_en && jrx_204c_en)
-            printf("  => JRX configured for JESD204C\n");
+    printf("  [SerDes PLL — not paged]\n");
+    snprintf(dec, sizeof(dec), "[3]=BF_RFPLLLOCK_LCPLL_RS=%u  %s",
+             (r0722 >> 3) & 1, jesd_pll ? "LOCKED" : "NOT LOCKED");
+    app_reg_print_u8(0x0722, "REG_PLL_STATUS_LCPLL", r0722, dec);
+
+    {
+        uint64_t jrx_rate = 0, jtx_rate = 0;
+        if (adi_ad9986_jesd_rx_bit_rate_get(dev, &jrx_rate) == API_CMS_ERROR_OK)
+            printf("  (computed)  JRX lane rate  : %llu bps (%.6f Gbps)  [uses 0x01FF + dac_freq]\n",
+                   (unsigned long long)jrx_rate, (double)jrx_rate / 1.0e9);
         else
-            printf("  => JRX: not yet configured (reset defaults)\n");
+            printf("  (computed)  JRX lane rate  : read failed\n");
+        if (adi_ad9986_jesd_tx_bit_rate_get(dev, AD9986_LINK_0, &jtx_rate) == API_CMS_ERROR_OK)
+            printf("  (computed)  JTX lane rate  : %llu bps (%.6f Gbps)  [uses 0x0289 + dac_freq]\n",
+                   (unsigned long long)jtx_rate, (double)jtx_rate / 1.0e9);
+        else
+            printf("  (computed)  JTX lane rate  : read failed\n");
     }
 
-    /* SYSREF status registers (HMC7044 CH_3 → AD9986 SYSREF input).
-     *
-     * Deframer (JRX, DAC path) — not paged:
-     *   0x04A0 JRX_TPL_0  bit[2] jrx_tpl_sysref_rcvd
-     *
-     * Framer (JTX, ADC path) — paged, link 0 already selected above:
-     *   0x0636 JTX_TPL_6  bit[1] jtx_tpl_sysref_rcvd
-     *                      bit[2] jtx_tpl_sysref_phase_err  (subclass 1 only)
-     *                      bit[5] jtx_tpl_sysref_mask       (=1 when subclass=0)
-     *   0x0667 JTX_DL_204C_0 bit[3] jtx_dl_204c_sysref_rcvd (204C link layer) */
-    {
-        uint8_t jrx_tpl0 = 0, jtx_tpl6 = 0, jtx_204c_0 = 0;
-
-        adi_ad9986_jesd_rx_link_select_set(dev, AD9986_LINK_0);
-        adi_ad9986_hal_reg_get(dev, 0x04A0, &jrx_tpl0);
-
-        adi_ad9986_jesd_tx_link_select_set(dev, AD9986_LINK_0);
-        adi_ad9986_hal_reg_get(dev, 0x0636, &jtx_tpl6);
-        adi_ad9986_hal_reg_get(dev, 0x0667, &jtx_204c_0);
-
-        printf("AD9986 SYSREF status:\n");
-        printf("  Deframer JRX_TPL_0     (0x04A0) = 0x%02x\n", jrx_tpl0);
-        printf("    [2] jrx_tpl_sysref_rcvd        = %d\n", (jrx_tpl0 >> 2) & 1);
-        printf("  Framer  JTX_TPL_6      (0x0636) = 0x%02x  [paged link0]\n", jtx_tpl6);
-        printf("    [0] bit0                        = %d\n", jtx_tpl6 & 1);
-        printf("    [1] jtx_tpl_sysref_rcvd        = %d\n", (jtx_tpl6 >> 1) & 1);
-        printf("    [2] jtx_tpl_sysref_phase_err   = %d\n", (jtx_tpl6 >> 2) & 1);
-        printf("    [5] jtx_tpl_sysref_mask        = %d  (1=masked/subclass0)\n",
-               (jtx_tpl6 >> 5) & 1);
-        printf("  Framer  JTX_DL_204C_0  (0x0667) = 0x%02x  [paged link0]\n", jtx_204c_0);
-        printf("    [3] jtx_dl_204c_sysref_rcvd    = %d\n", (jtx_204c_0 >> 3) & 1);
-    }
+    /* ------------------------------------------------------------------ */
+    /* Section 2 — HMC7044 register dump (SPI1 CS0)                        */
+    /* ------------------------------------------------------------------ */
+    app_hmc7044_reg_dump(hmc);
 
     return API_CMS_ERROR_OK;
+}
+
+/* Read the four JRX 204C error/IRQ fields once, print them, clear IRQ latches.
+ * Returns 0 if clean, -1 if any error detected. */
+static int32_t app_ad9986_irq_once(adi_ad9986_device_t *dev)
+{
+    uint8_t cfg_valid=0, irq_st=0;
+    uint8_t r01FE=0, r05BB=0;
+    char dec[128];
+
+    adi_ad9986_hal_reg_get(dev, 0x01FE, &r01FE);
+    adi_ad9986_hal_reg_get(dev, 0x05BB, &r05BB);
+    adi_ad9986_jesd_rx_config_status_get(dev, &cfg_valid);
+    adi_ad9986_jesd_rx_204c_crc_irq_status_get(dev, AD9986_LINK_0, &irq_st);
+    adi_ad9986_jesd_rx_204c_crc_irq_clr(dev, AD9986_LINK_0);
+    adi_ad9986_jesd_rx_204c_mb_irq_status_get(dev, AD9986_LINK_0, &irq_st);
+    adi_ad9986_jesd_rx_204c_mb_irq_clr(dev, AD9986_LINK_0);
+    adi_ad9986_jesd_rx_204c_sh_irq_status_get(dev, AD9986_LINK_0, &irq_st);
+    adi_ad9986_jesd_rx_204c_sh_irq_clr(dev, AD9986_LINK_0);
+    printf("AD9986 JRX 204C error IRQ status:\n");
+    snprintf(dec, sizeof(dec),
+             "[5:0]=BF_TX_JESD_MODE=%u  [7]=BF_MODE_NOT_IN_TABLE=%u  (0=OK, 1=mismatch)",
+             r01FE & 0x3F, cfg_valid);
+    app_reg_print_u8(0x01FE, "REG_JESD_MODE", r01FE, dec);
+    snprintf(dec, sizeof(dec),
+             "[3]=BF_JRX_204C_CRC_IRQ=%u  [4]=BF_JRX_204C_MB_IRQ=%u  [5]=BF_JRX_204C_SH_IRQ=%u"
+             "  (latched, cleared after read)",
+             (r05BB >> 3) & 1, (r05BB >> 4) & 1, (r05BB >> 5) & 1);
+    app_reg_print_u8(0x05BB, "REG_JRX_204C_IRQ", r05BB, dec);
+    return (cfg_valid == 1 || (r05BB & 0x38)) ? -1 : 0;
+}
+
+/* Run one 1-second JRX sample PRBS window under SPI lock. */
+static int32_t app_ad9986_jrx_sample_prbs_once(adi_ad9986_device_t *dev,
+    uint8_t *error_flag, uint32_t *error_count_i, uint32_t *error_count_q)
+{
+    int32_t err;
+
+    pthread_mutex_lock(&g_spi_mtx);
+    err = adi_ad9986_jesd_rx_sample_prbs_test(dev, PRBS7, 0, 1);
+    if (err == API_CMS_ERROR_OK)
+        err = adi_ad9986_jesd_rx_sample_prbs_test_result_get(dev, error_flag, error_count_i, error_count_q);
+    pthread_mutex_unlock(&g_spi_mtx);
+    return err;
+}
+
+/* AD9986 JRX transport-layer PRBS7 checker (FPGA→AD9986 direction).
+ * FPGA TX already drives transport-layer PRBS7 via ad_pngen_new1 in top.sv
+ * (hardwired to jesd_tx_tl_in_tdata — no software setup required).
+ * Loops the AD9986 sample PRBS checker in 1-second windows.
+ * Startup windows are cleared silently until error_flag reaches 0; only then
+ * are results printed and non-zero errors treated as real link failures. */
+static void app_ad9986_jrx_sample_prbs(adi_ad9986_device_t *dev)
+{
+    int32_t  err;
+    uint8_t  error_flag;
+    uint32_t error_count_i, error_count_q;
+    uint32_t iter = 0;
+
+    printf("AD9986 JRX sample PRBS7 checker (FPGA→AD9986, transport layer).\n");
+    printf("Press Ctrl+C to stop.\n");
+
+    /* Clear startup false errors: each test window pulses CLR_ERRORS internally.
+     * Do not print anything until the first window reads back all zeros. */
+    printf("Clearing PRBS errors to baseline 0 (not printing yet)...\n");
+    for (;;) {
+        err = app_ad9986_jrx_sample_prbs_once(dev, &error_flag, &error_count_i, &error_count_q);
+        if (err != API_CMS_ERROR_OK) {
+            printf("JRX sample PRBS: clear phase failed (%d).\n", err);
+            return;
+        }
+        if (error_flag == 0)
+            break;
+    }
+    printf("PRBS baseline cleared — monitoring started.\n");
+
+    while (1) {
+        time_t now = time(NULL);
+        struct tm *t = localtime(&now);
+        char dec[160];
+        char dec32[96];
+
+        iter++;
+
+        err = app_ad9986_jrx_sample_prbs_once(dev, &error_flag, &error_count_i, &error_count_q);
+        if (err != API_CMS_ERROR_OK) {
+            printf("JRX sample PRBS: test/result failed (%d).\n", err);
+            break;
+        }
+        printf("[%02d:%02d:%02d] iter=%-4u\n",
+               t->tm_hour, t->tm_min, t->tm_sec, iter);
+        snprintf(dec, sizeof(dec),
+                 "[0]=BF_PRBS_INVALID_DATA_FLAG_I=%u  [1]=BF_PRBS_INVALID_DATA_FLAG_Q=%u"
+                 "  [2]=BF_PRBS_ERROR_FLAG_I=%u  [3]=BF_PRBS_ERROR_FLAG_Q=%u  %s",
+                 error_flag & 1, (error_flag >> 1) & 1,
+                 (error_flag >> 2) & 1, (error_flag >> 3) & 1,
+                 error_flag ? "ERROR" : "OK");
+        app_reg_print_u8(0x2063, "REG_SAMPLE_PRBS_STATUS0", error_flag, dec);
+        snprintf(dec32, sizeof(dec32), "[23:0]=BF_ERROR_COUNT_I=%u", error_count_i);
+        app_reg_print_u32(0x2064, "REG_SAMPLE_PRBS_STATUS1", error_count_i, dec32);
+        snprintf(dec32, sizeof(dec32), "[23:0]=BF_ERROR_COUNT_Q=%u", error_count_q);
+        app_reg_print_u32(0x2067, "REG_SAMPLE_PRBS_STATUS3", error_count_q, dec32);
+        if (error_flag)
+            break;
+    }
 }
 
 /* Read HMC7044 CH_13 output control registers and report clock output status.
@@ -460,26 +794,25 @@ static int32_t app_hmc7044_ch13_status(adi_hmc7044_device_t *dev)
 
     divider = (uint16_t)ctrl1 | ((uint16_t)(ctrl2 & 0x0F) << 8);
 
-    printf("HMC7044 CH_13 clock output status:\n");
-    printf("  CTRL_0 (0x014A) = 0x%02x\n", ctrl0);
-    printf("    [0]   channel enable    = %d  %s\n",
-           ctrl0 & 1, (ctrl0 & 1) ? "(enabled)" : "(DISABLED)");
-    printf("    [3:2] startup_mode      = %d  %s\n",
-           (ctrl0 >> 2) & 3,
-           ((ctrl0 >> 2) & 3) == 0 ? "(continuous clock -- not SYSREF mode)"
-         : ((ctrl0 >> 2) & 3) == 1 ? "(startup pulse generator)"
-         : ((ctrl0 >> 2) & 3) == 2 ? "(re-arm pulse generator)"
-                                   : "(pulse generator mode 3)");
-    printf("    [5]   slip_en           = %d\n", (ctrl0 >> 5) & 1);
-    printf("    [6]   sync_en           = %d\n", (ctrl0 >> 6) & 1);
-    printf("    [7]   high_perform_en   = %d\n", (ctrl0 >> 7) & 1);
-    printf("  CTRL_1 (0x014B) = 0x%02x  (divider[7:0])\n", ctrl1);
-    printf("  CTRL_2 (0x014C) = 0x%02x  (divider[11:8])\n", ctrl2 & 0x0F);
-    printf("  Channel divider = %u  (expected 352 = 0x160: VCO 2703.36 MHz / 7.68 MHz)\n",
-           divider);
-    printf("  CTRL_8 (0x0152) = 0x%02x  (driver: force_mute[7:6] drv_mode[4:3] impedance[1:0])\n",
-           ctrl8);
-    printf("    force_mute      = %d\n", (ctrl8 >> 6) & 3);
+    {
+        char dec[160];
+        printf("HMC7044 CH_13 clock output status:\n");
+        snprintf(dec, sizeof(dec),
+                 "[0]=CH_enable=%u  [3:2]=CH_startup_mode=%u  [5]=CH_slip_en=%u"
+                 "  [6]=CH_sync_en=%u  [7]=CH_high_perform_en=%u",
+                 ctrl0 & 1, (ctrl0 >> 2) & 3, (ctrl0 >> 5) & 1,
+                 (ctrl0 >> 6) & 1, (ctrl0 >> 7) & 1);
+        app_reg_print_u8(0x014A, "CH_13_CTRL_0", ctrl0, dec);
+        snprintf(dec, sizeof(dec), "[7:0]=CH_divider[7:0]=%u", ctrl1);
+        app_reg_print_u8(0x014B, "CH_13_CTRL_1", ctrl1, dec);
+        snprintf(dec, sizeof(dec), "[3:0]=CH_divider[11:8]=%u", ctrl2 & 0x0F);
+        app_reg_print_u8(0x014C, "CH_13_CTRL_2", ctrl2, dec);
+        printf("  (derived)   CH_13 divider           = %u  (expected 352 = 0x160)\n", divider);
+        snprintf(dec, sizeof(dec),
+                 "[7:6]=CH_force_mute=%u  [4:3]=CH_driver_mode=%u  [1:0]=CH_impedance=%u",
+                 (ctrl8 >> 6) & 3, (ctrl8 >> 3) & 3, ctrl8 & 3);
+        app_reg_print_u8(0x0152, "CH_13_CTRL_8", ctrl8, dec);
+    }
 
     /* Summary */
     int ch_enabled     = (ctrl0 & 1);
@@ -511,8 +844,11 @@ static int32_t app_hmc7044_ch13_unmute(adi_hmc7044_device_t *dev)
         printf("HMC7044 CH_13: SPI read 0x0152 failed (%d).\n", err);
         return err;
     }
-    printf("HMC7044 CH_13: CTRL_8 before = 0x%02x  force_mute = %d\n",
-           ctrl8, (ctrl8 >> 6) & 3);
+    {
+        char dec[96];
+        snprintf(dec, sizeof(dec), "[7:6]=CH_force_mute=%u  (before unmute)", (ctrl8 >> 6) & 3);
+        app_reg_print_u8(0x0152, "CH_13_CTRL_8", ctrl8, dec);
+    }
 
     ctrl8 &= 0x3F; /* clear force_mute bits[7:6] */
 
@@ -527,11 +863,14 @@ static int32_t app_hmc7044_ch13_unmute(adi_hmc7044_device_t *dev)
         printf("HMC7044 CH_13: SPI read 0x0152 failed (%d).\n", err);
         return err;
     }
-    printf("HMC7044 CH_13: CTRL_8 after  = 0x%02x  force_mute = %d  %s\n",
-           ctrl8,
-           (ctrl8 >> 6) & 3,
-           ((ctrl8 >> 6) & 3) == 0 ? "(not muted -- output active)"
-                                   : "(still muted -- check SPI write path)");
+    {
+        char dec[96];
+        snprintf(dec, sizeof(dec), "[7:6]=CH_force_mute=%u  %s",
+                 (ctrl8 >> 6) & 3,
+                 ((ctrl8 >> 6) & 3) == 0 ? "(not muted -- output active)"
+                                        : "(still muted -- check SPI write path)");
+        app_reg_print_u8(0x0152, "CH_13_CTRL_8", ctrl8, dec);
+    }
     return API_CMS_ERROR_OK;
 }
 
@@ -714,8 +1053,7 @@ static int32_t app_hmc7044_init(adi_hmc7044_device_t *dev)
  * a WARNING is emitted on any unlock and a recovery notice on re-lock.
  *
  * Override the interval at build time: -DPLL_MONITOR_INTERVAL_S=<n>
- * g_spi_mtx serialises SPI bus access between this thread and the main thread
- * menu handlers; acquire it around any API call outside of startup. */
+ * Acquire g_spi_mtx around any SPI API call outside of startup. */
 
 #ifndef PLL_MONITOR_INTERVAL_S
 #define PLL_MONITOR_INTERVAL_S 5
@@ -726,7 +1064,6 @@ typedef struct {
     adi_ad9986_device_t  *ad9;
 } pll_mon_ctx_t;
 
-static pthread_mutex_t g_spi_mtx  = PTHREAD_MUTEX_INITIALIZER;
 static volatile int    g_mon_stop = 0;
 static uint8_t g_hmc_pll_state    = 0xFF; /* 0xFF = not yet seeded */
 static uint8_t g_ad9_pll_state    = 0xFF;
@@ -754,25 +1091,36 @@ static void *pll_monitor_thread(void *arg)
 
         if (adi_hmc7044_device_pll_lock_status_get(ctx->hmc, &hmc_st) == API_CMS_ERROR_OK
                 && hmc_st != g_hmc_pll_state) {
+            char dec[96];
+            uint8_t r7c = 0, r7d = 0;
             if (!(hmc_st & HMC7044_PLL1_AND_PLL2_LOCK_ST))
-                printf("\n[PLL MONITOR] WARNING: HMC7044 PLL not locked"
-                       " (0x%02x  PLL1=%s  PLL2=%s)\n", hmc_st,
-                       (hmc_st & HMC7044_PLL1_LOCK_ST) ? "ok" : "UNLOCKED",
-                       (hmc_st & HMC7044_PLL2_LOCK_ST) ? "ok" : "UNLOCKED");
+                printf("\n[PLL MONITOR] WARNING: HMC7044 PLL not locked\n");
             else
-                printf("\n[PLL MONITOR] HMC7044 PLL lock restored (0x%02x).\n", hmc_st);
+                printf("\n[PLL MONITOR] HMC7044 PLL lock restored\n");
+            adi_hmc7044_device_spi_register_get(ctx->hmc, 0x007C, &r7c);
+            adi_hmc7044_device_spi_register_get(ctx->hmc, 0x007D, &r7d);
+            snprintf(dec, sizeof(dec), "[5]=PLL1_lock=%u  API=%s",
+                     (r7c >> 5) & 1, (hmc_st & HMC7044_PLL1_LOCK_ST) ? "LOCKED" : "NOT LOCKED");
+            app_reg_print_u8(0x007C, "HMC7044_PLL1_STATUS", r7c, dec);
+            snprintf(dec, sizeof(dec), "[0]=PLL2_lock=%u  API=%s",
+                     r7d & 1, (hmc_st & HMC7044_PLL2_LOCK_ST) ? "LOCKED" : "NOT LOCKED");
+            app_reg_print_u8(0x007D, "HMC7044_PLL2_STATUS", r7d, dec);
             g_hmc_pll_state = hmc_st;
         }
 
         if (adi_ad9986_device_clk_pll_lock_status_get(ctx->ad9, &ad9_st) == API_CMS_ERROR_OK
                 && ad9_st != g_ad9_pll_state) {
-            if (ad9_st != 0x03)
-                printf("\n[PLL MONITOR] WARNING: AD9986 clock PLL not locked"
-                       " (0x%02x  FAST=%s  SLOW=%s)\n", ad9_st,
-                       (ad9_st & 0x01) ? "ok" : "UNLOCKED",
-                       (ad9_st & 0x02) ? "ok" : "UNLOCKED");
-            else
-                printf("\n[PLL MONITOR] AD9986 clock PLL lock restored (0x%02x).\n", ad9_st);
+            char dec[96];
+            if (ad9_st != 0x03) {
+                printf("\n[PLL MONITOR] WARNING: AD9986 clock PLL not locked\n");
+                snprintf(dec, sizeof(dec), "[0]=BF_PLL_LOCK_SLOW=%s  [1]=BF_PLL_LOCK_FAST=%s",
+                         (ad9_st & 0x01) ? "LOCKED" : "NOT LOCKED",
+                         (ad9_st & 0x02) ? "LOCKED" : "NOT LOCKED");
+            } else {
+                printf("\n[PLL MONITOR] AD9986 clock PLL lock restored\n");
+                snprintf(dec, sizeof(dec), "[0]=BF_PLL_LOCK_SLOW=LOCKED  [1]=BF_PLL_LOCK_FAST=LOCKED");
+            }
+            app_reg_print_u8(0x2008, "REG_CLK_PLL_STATUS", ad9_st, dec);
             g_ad9_pll_state = ad9_st;
         }
 
@@ -820,6 +1168,7 @@ static int32_t app_ad9986_prbs_test(adi_ad9986_device_t *dev,
     printf("AD9986: JRX PHY %s test (%d lanes, 100 ms).\n",
            prbs_pattern_name(prbs), NUM_LANES);
 
+    adi_ads9_reg_set(0x537, 4);  /* stop any active GT TX pattern play */
     if (err = adi_ads9_stop_transmit(), err != API_CMS_ERROR_OK) {
         printf("AD9986 PRBS: FPGA stop transmit failed (%d).\n", err);
         return err;
@@ -839,15 +1188,23 @@ static int32_t app_ad9986_prbs_test(adi_ad9986_device_t *dev,
     }
 
     for (lane = 0; lane < NUM_LANES; lane++) {
+        char lane_name[32];
+        char dec[96];
+        uint8_t r_test3 = 0;
+
         if (err = adi_ad9986_jesd_rx_phy_prbs_test_result_get(dev, lane, &result),
             err != API_CMS_ERROR_OK) {
             printf("AD9986 PRBS: lane %d result read failed (%d).\n", lane, err);
             goto restore;
         }
-        printf("AD9986 PRBS: lane %d -- %s  err_cnt=%u\n",
-               lane,
-               result.phy_prbs_pass ? "PASS" : "FAIL",
-               result.phy_prbs_err_cnt);
+        adi_ad9986_hal_reg_get(dev, 0x0953 + lane, &r_test3);
+        snprintf(lane_name, sizeof(lane_name), "REG_JRX_TEST_3_LANE%d", lane);
+        snprintf(dec, sizeof(dec),
+                 "[6]=BF_JRX_PRBS_LANE_INVALID_DATA_FLAG=%u  [7]=BF_JRX_PRBS_LANE_ERROR_FLAG=%u"
+                 "  API_pass=%s  API_err_cnt=%u",
+                 (r_test3 >> 6) & 1, (r_test3 >> 7) & 1,
+                 result.phy_prbs_pass ? "YES" : "NO", result.phy_prbs_err_cnt);
+        app_reg_print_u8(0x0953 + lane, lane_name, r_test3, dec);
         if (result.phy_prbs_pass)
             pass_cnt++;
     }
@@ -862,104 +1219,308 @@ restore:
     return err;
 }
 
-/* Configure the AD9986 for JESD204C using uc_settings.c array index 1 parameters.
+/* Enable AD9986 JTX PHY PRBS7 on link 0.
+ * Puts all active JTX serializer lanes into PRBS7 test-pattern mode so the
+ * FPGA RX can check the pattern with its own PRBS checker.
+ * Call app_ad9986_jtx_prbs_stop() to return to normal JESD data. */
+static int32_t app_ad9986_jtx_prbs_start(adi_ad9986_device_t *dev)
+{
+    int32_t err;
+    /* Inject PRBS7 at the JTX framer TRANSPORT-LAYER (sample) input — not the PHY.
+     * data_source = AD9986_JESD_TX_TEST_DATA_SAMPLE routes PRBS7 through the framer,
+     * lane crossbar, scrambler (off here) and 64B/66B encoder, so the FPGA deframer
+     * recovers PRBS7 on the sample stream.  This exercises the full framer datapath.
+     * Prerequisite: the JESD204C link must be UP (run option 4, confirm with option 3)
+     * before enabling, because sample-source PRBS travels the whole link. */
+    if (err = adi_ad9986_jesd_tx_gen_test(dev, AD9986_LINK_0,
+              AD9986_JESD_TX_TEST_DATA_SAMPLE, AD9986_JESD_TX_TEST_MODE_PN7),
+        err != API_CMS_ERROR_OK) {
+        printf("AD9986 JTX PRBS: enable sample-PRBS7 failed (%d).\n", err);
+        return err;
+    }
+    printf("AD9986 JTX framer PRBS7 at transport-layer input active — FPGA deframer should see PRBS7.\n");
+    return API_CMS_ERROR_OK;
+}
+
+/* Disable AD9986 JTX PHY PRBS and restore normal JESD data output. */
+static int32_t app_ad9986_jtx_prbs_stop(adi_ad9986_device_t *dev)
+{
+    int32_t err;
+    if (err = adi_ad9986_jesd_tx_gen_test(dev, AD9986_LINK_0,
+              AD9986_JESD_TX_TEST_DATA_SAMPLE, AD9986_JESD_TX_TEST_MODE_DISABLED),
+        err != API_CMS_ERROR_OK) {
+        printf("AD9986 JTX PRBS: disable failed (%d).\n", err);
+        return err;
+    }
+    printf("AD9986 JTX framer PRBS disabled — TX returning to normal JESD sample data.\n");
+    return API_CMS_ERROR_OK;
+}
+
+/* Shared JESD204C bring-up sequence for the Raspberry Pi control plane.
  *
- * clk_hz[1]: dev_ref=122.88 MHz, DAC=7864.32 MHz, ADC=3932.16 MHz.
- * JRX (FPGA→AD9986 DAC): jrx_param[1] with jesd_jesdv overridden to 2 (204C).
- *   1L 8F 4M 1S K=32 N=16, mode 2, subclass=1, scr=0, main_interp=4, chan_interp=4.
- * JTX (AD9986 ADC→FPGA): jtx_param[1][0] with jesd_jesdv overridden to 2 (204C).
- *   1L 8F 4M 1S HD=0 K=32 N=16, mode 1, subclass=1, scr=0, CDDC 0-3 DCM×2, FDDC 0/1/4/5 DCM×4. */
-static int32_t app_ad9986_jesd204c_config(adi_ad9986_device_t *dev)
+ * Every datapath and link parameter is read directly from the use-case tables
+ * in uc_settings.c at index AD9986_UC_INDEX; there are no parameter literals in
+ * this file.  Index 1 selects the JESD204C use case (dev_ref=122.88 MHz,
+ * DAC=7864.32 MHz, ADC=3932.16 MHz; JRX and JTX = 1L 4F 2M 1S, K=64, subclass 1,
+ * jesd_jesdv=2).  Both the initial bring-up in main() and menu option 4 call
+ * this single routine, so the sequence exists in exactly one place. */
+static int32_t app_ad9986_jesd204c_bringup(adi_ad9986_device_t *dev)
 {
     int32_t err;
 
-    /* jrx_param[1]: values from uc_settings.c uc1 active row; jesdv overridden to 2 (204C). */
-    adi_cms_jesd_param_t jrx_param = {
-        .jesd_l        = 1,  .jesd_f      = 8, .jesd_m   = 4,  .jesd_s    = 1,
-        .jesd_hd       = 0,  .jesd_k      = 32,
-        .jesd_n        = 16, .jesd_np     = 16,
-        .jesd_cf       = 0,  .jesd_cs     = 0,
-        .jesd_did      = 0,  .jesd_bid    = 0,  .jesd_lid0 = 0,
-        .jesd_subclass = 1,  .jesd_scr    = 0,  .jesd_duallink = 0,
-        .jesd_jesdv    = 2,  .jesd_mode_id = 2,
-    };
+    printf("AD9986: configuring JESD204C (uc_settings index %d)...\n", AD9986_UC_INDEX);
 
-    /* jtx_param[1][0]: values from uc_settings.c uc1 active row; jesdv overridden to 2 (204C). */
-    adi_cms_jesd_param_t jtx_param[2] = {
-        {
-            .jesd_l        = 1,  .jesd_f      = 8, .jesd_m   = 4,  .jesd_s    = 1,
-            .jesd_hd       = 0,  .jesd_k      = 32,
-            .jesd_n        = 16, .jesd_np     = 16,
-            .jesd_cf       = 0,  .jesd_cs     = 0,
-            .jesd_did      = 0,  .jesd_bid    = 0,  .jesd_lid0 = 0,
-            .jesd_subclass = 1,  .jesd_scr    = 0,  .jesd_duallink = 0,
-            .jesd_jesdv    = 2,  .jesd_mode_id = 1,
-            .jesd_mode_c2r_en = 0, .jesd_mode_s_sel = 0,
-        },
-        { 0 }
-    };
+    /* Step 1: program FPGA JESD204C link parameters (uc_settings.c index 1). */
+    {
+        adi_cms_jesd_param_t jrx_param_fpga[2] = { jrx_param[AD9986_UC_INDEX], { 0 } };
+        if (err = adi_ads9_config_jesd(jrx_param_fpga, jtx_param[AD9986_UC_INDEX]), err != API_CMS_ERROR_OK) {
+            printf("FPGA: JESD204C config failed (%d).\n", err);
+            return err;
+        }
+    }
+    printf("FPGA: JESD IP configured for JESD204C.\n");
 
-    /* tx_interp[1]: main=4, chan=4; tx_dac_chan_xbar[1]: CH_0..CH_3 */
-    uint8_t  dac_chan[4]   = { AD9986_DAC_CH_0, AD9986_DAC_CH_1,
-                               AD9986_DAC_CH_2, AD9986_DAC_CH_3 };
-    /* tx_main_shift[1]: 1842.5 MHz on each DAC main path */
-    int64_t  main_shift[4] = { 1842500000LL, 1842500000LL,
-                                1842500000LL, 1842500000LL };
-    int64_t  chan_shift[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    /* Step 2: FPGA SYSREF source and continuous re-alignment registers.
+     * sysref_config(0) = FMC-routed SYSREF (HMC7044 CH_13 → FPGA SYSREF pin).
+     * 0x602 / 0x202 = jesd204c_tx/rx_sysref_always: re-align every LEMC boundary
+     * in SYSREF_CONT mode (required for subclass-1 204C). */
+    if (err = adi_ads9_sysref_config(0), err != API_CMS_ERROR_OK) {
+        printf("FPGA: sysref_config failed (%d).\n", err);
+        return err;
+    }
+    if (err = adi_ads9_reg_set(0x602, 0x0001), err != API_CMS_ERROR_OK) {
+        printf("FPGA: 0x602 (tx_sysref_always) write failed (%d).\n", err);
+        return err;
+    }
+    if (err = adi_ads9_reg_set(0x202, 0x0001), err != API_CMS_ERROR_OK) {
+        printf("FPGA: 0x202 (rx_sysref_always) write failed (%d).\n", err);
+        return err;
+    }
+    /* Set FPGA BRAM capture size and TX pattern player address/length so the
+     * GT pattern player (0x537=1) sends repeating data rather than 0 bytes.
+     * Without these the pattern length register defaults to 0 and no data is
+     * transmitted, preventing CDR lock on the AD9986 JRX deserializer.
+     * Matches the ADS9 reference app (app_ads9/ad9986_app.c lines 403-408). */
+    if (err = adi_ads9_capture_size_set(0x20), err != API_CMS_ERROR_OK) {
+        printf("FPGA: capture_size_set failed (%d).\n", err);
+        return err;
+    }
+    if (err = adi_ads9_pattern_addr_set(0x80000000), err != API_CMS_ERROR_OK) {
+        printf("FPGA: pattern_addr_set failed (%d).\n", err);
+        return err;
+    }
+    if (err = adi_ads9_pattern_len_set(0x8000), err != API_CMS_ERROR_OK) {
+        printf("FPGA: pattern_len_set failed (%d).\n", err);
+        return err;
+    }
+    printf("FPGA: SYSREF source, alignment registers, and pattern player configured.\n");
 
-    /* rx_cddc_shift[1]: CDDC 0/1 = 1842.5 MHz, CDDC 2/3 = 350 MHz */
-    int64_t  cddc_shift[4] = { 1842500000LL, 1842500000LL,
-                                 350000000LL,  350000000LL };
-    int64_t  fddc_shift[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-    /* rx_cddc_dcm[1]: all four CDDCs decimate by 2 */
-    uint8_t  cddc_dcm[4]   = { AD9986_CDDC_DCM_2, AD9986_CDDC_DCM_2,
-                                AD9986_CDDC_DCM_2, AD9986_CDDC_DCM_2 };
-    /* rx_fddc_dcm[1]: FDDC 0, 1, 4, 5 decimate by 4; slots 2, 3, 6, 7 unused */
-    uint8_t  fddc_dcm[8]   = { AD9986_FDDC_DCM_4, AD9986_FDDC_DCM_4,
-                                0, 0,
-                                AD9986_FDDC_DCM_4, AD9986_FDDC_DCM_4,
-                                0, 0 };
-    uint8_t  cc2r_en[4]    = { 0, 0, 0, 0 };
-    uint8_t  fc2r_en[8]    = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    /* Step 3: FPGA TX SerDes lane driver for 204C at 16.22 Gbps. */
+    if (err = adi_ads9_jesd_tx_lane_driver_config(0xFF, 0x0, 0x0, 0x14),
+        err != API_CMS_ERROR_OK) {
+        printf("FPGA: TX lane driver config failed (%d).\n", err);
+        return err;
+    }
+    printf("FPGA: TX lane driver configured for 16.22 Gbps 204C.\n");
 
-    /* jtx_conv_sel[1] link0: M=8 → converters 0-7 = FDDC 0I/0Q/1I/1Q/4I/4Q/5I/5Q */
-    adi_ad9986_jtx_conv_sel_t jesd_conv_sel[2] = {
-        {
-            .virtual_converter0_index = AD9986_FDDC_0_I,
-            .virtual_converter1_index = AD9986_FDDC_0_Q,
-            .virtual_converter2_index = AD9986_FDDC_1_I,
-            .virtual_converter3_index = AD9986_FDDC_1_Q,
-            .virtual_converter4_index = AD9986_FDDC_4_I,
-            .virtual_converter5_index = AD9986_FDDC_4_Q,
-            .virtual_converter6_index = AD9986_FDDC_5_I,
-            .virtual_converter7_index = AD9986_FDDC_5_Q,
-        },
-        { 0 }
-    };
+    /* Step 4: First bidir_start — put FPGA TX in skip-data mode and start
+     * bidirectional synchronization.  The bidir_start triggers the FPGA JESD TX
+     * state machine to generate proper JESD204C sync headers.  Without this the
+     * FPGA transmits unframed data and the AD9986 JRX link layer cannot lock. */
+    if (err = adi_ads9_reg_set(0x540, 1), err != API_CMS_ERROR_OK) {
+        printf("FPGA: transmit_skip_data write failed (%d).\n", err);
+        return err;
+    }
+    if (err = adi_ads9_reg_set(0x106, 0x000), err != API_CMS_ERROR_OK) {
+        printf("FPGA: skip_rx_link_init=0 write failed (%d).\n", err);
+        return err;
+    }
+    if (err = adi_ads9_reg_set(0x947, 2), err != API_CMS_ERROR_OK) {
+        printf("FPGA: bidir_start (1st) write failed (%d).\n", err);
+        return err;
+    }
+    if (err = adi_ads9_reg_set(0x106, 0x400), err != API_CMS_ERROR_OK) {
+        printf("FPGA: skip_rx_link_init=1 write failed (%d).\n", err);
+        return err;
+    }
+    printf("FPGA: first bidir_start complete — JESD TX generating 204C sync headers.\n");
 
-    printf("AD9986: configuring JESD204C (uc_settings index 1)...\n");
-
+    /* Step 5: AD9986 JRX bring-up with FPGA TX sending 204C sync headers. */
     if (err = adi_ad9986_device_startup_tx(dev,
-              4 /*main_interp*/, 4 /*chan_interp*/,
-              dac_chan, main_shift, chan_shift, &jrx_param), err != API_CMS_ERROR_OK) {
+              tx_interp[AD9986_UC_INDEX][0] /*main_interp*/, tx_interp[AD9986_UC_INDEX][1] /*chan_interp*/,
+              tx_dac_chan_xbar[AD9986_UC_INDEX], tx_main_shift[AD9986_UC_INDEX],
+              tx_chan_shift[AD9986_UC_INDEX], &jrx_param[AD9986_UC_INDEX]), err != API_CMS_ERROR_OK) {
         printf("AD9986: startup_tx (JRX/DAC path) failed (%d).\n", err);
         return err;
     }
-    printf("AD9986: JRX (DAC path) JESD204C configured.\n");
+    printf("AD9986: JRX (DAC path) JESD204C configured. JRX lane rate = %lu bps (%.3f Gbps).\n",
+           (unsigned long)dev->dev_info.jesd_rx_lane_rate,
+           (double)dev->dev_info.jesd_rx_lane_rate / 1.0e9);
 
+    /* Step 6: Explicitly enable JRX link 0 so the AD9986 JRX state machine
+     * can progress from INIT state toward LINK_DATA. */
+    if (err = adi_ad9986_jesd_rx_link_enable_set(dev, AD9986_LINK_0, 1),
+        err != API_CMS_ERROR_OK) {
+        printf("AD9986: JRX link 0 enable failed (%d).\n", err);
+        return err;
+    }
+    printf("AD9986: JRX link 0 enabled.\n");
+
+    /* Step 7: AD9986 JTX bring-up (ADC → FPGA RX path). */
     if (err = adi_ad9986_device_startup_rx(dev,
-              AD9986_ADC_CDDC_0 | AD9986_ADC_CDDC_1 |
-              AD9986_ADC_CDDC_2 | AD9986_ADC_CDDC_3  /*cddcs*/,
-              AD9986_ADC_FDDC_0 | AD9986_ADC_FDDC_1 |
-              AD9986_ADC_FDDC_4 | AD9986_ADC_FDDC_5  /*fddcs*/,
-              cddc_shift, fddc_shift,
-              cddc_dcm, fddc_dcm,
-              cc2r_en, fc2r_en,
-              jtx_param, jesd_conv_sel), err != API_CMS_ERROR_OK) {
+              rx_cddc_select[AD9986_UC_INDEX] /*cddcs*/,
+              rx_fddc_select[AD9986_UC_INDEX] /*fddcs*/,
+              rx_cddc_shift[AD9986_UC_INDEX], rx_fddc_shift[AD9986_UC_INDEX],
+              rx_cddc_dcm[AD9986_UC_INDEX], rx_fddc_dcm[AD9986_UC_INDEX],
+              rx_cddc_c2r[AD9986_UC_INDEX], rx_fddc_c2r,
+              jtx_param[AD9986_UC_INDEX], jtx_conv_sel[AD9986_UC_INDEX]), err != API_CMS_ERROR_OK) {
         printf("AD9986: startup_rx (JTX/ADC path) failed (%d).\n", err);
         return err;
     }
     printf("AD9986: JTX (ADC path) JESD204C configured.\n");
+
+    /* Step 8: Subclass-1 SYSREF synchronization.
+     * Configure AD9986 SYSREF input (AC-coupled CML differential), arm CDDC NCO
+     * sync on SYSREF, then perform oneshot sync to capture the LEMC boundary. */
+    if (err = adi_ad9986_sync_sysref_input_config_set(dev,
+              COUPLING_AC, SIGNAL_CML, 0, 0), err != API_CMS_ERROR_OK) {
+        printf("AD9986: SYSREF input config failed (%d).\n", err);
+        return err;
+    }
+    if (err = adi_ad9986_adc_ddc_coarse_sync_enable_set(dev,
+              AD9986_ADC_CDDC_ALL, 1), err != API_CMS_ERROR_OK) {
+        printf("AD9986: CDDC coarse_sync_enable failed (%d).\n", err);
+        return err;
+    }
+    if (err = adi_ad9986_adc_ddc_coarse_sync_next_set(dev,
+              AD9986_ADC_CDDC_ALL, 1), err != API_CMS_ERROR_OK) {
+        printf("AD9986: CDDC coarse_sync_next failed (%d).\n", err);
+        return err;
+    }
+    if (err = adi_ad9986_adc_ddc_coarse_trig_nco_reset_enable_set(dev,
+              AD9986_ADC_CDDC_ALL, 0), err != API_CMS_ERROR_OK) {
+        printf("AD9986: CDDC trig_nco_reset_enable failed (%d).\n", err);
+        return err;
+    }
+    if (err = adi_ad9986_jesd_oneshot_sync(dev, JESD_SUBCLASS_1),
+        err != API_CMS_ERROR_OK) {
+        printf("AD9986: oneshot_sync failed (%d)%s.\n", err,
+               (err == API_CMS_ERROR_JESD_SYNC_NOT_DONE) ? " (SYSREF not captured)" : "");
+        return err;
+    }
+    printf("AD9986: SYSREF oneshot sync complete (LEMC aligned).\n");
+
+    /* Step 9: Explicitly enable JTX link 0. */
+    if (err = adi_ad9986_jesd_tx_link_enable_set(dev, AD9986_LINK_0, 1),
+        err != API_CMS_ERROR_OK) {
+        printf("AD9986: JTX link 0 enable failed (%d).\n", err);
+        return err;
+    }
+    printf("AD9986: JTX link 0 enabled.\n");
+
+    /* Step 10: Second bidir_start + 100 ms wait.  Re-asserts bidirectional sync
+     * after both JRX and JTX links are enabled and SYSREF is aligned. */
+    if (err = adi_ads9_reg_set(0x106, 0x000), err != API_CMS_ERROR_OK) {
+        printf("FPGA: skip_rx_link_init=0 (2nd bidir) failed (%d).\n", err);
+        return err;
+    }
+    if (err = adi_ads9_reg_set(0x947, 2), err != API_CMS_ERROR_OK) {
+        printf("FPGA: bidir_start (2nd) write failed (%d).\n", err);
+        return err;
+    }
+    lattice_wait_us(NULL, 100000);
+    if (err = adi_ads9_reg_set(0x106, 0x400), err != API_CMS_ERROR_OK) {
+        printf("FPGA: skip_rx_link_init=1 (2nd bidir) failed (%d).\n", err);
+        return err;
+    }
+    printf("FPGA: second bidir_start complete.\n");
+
+    /* Step 11: Stop GT pattern play and reset JRX link; keep bidir+skip_data.
+     *
+     * On the RPi board, BRAM at 0x80000000 is NOT pre-loaded with valid
+     * 66b/64b JESD data (unlike the ADS9 reference board).  Starting the GT
+     * pattern player (0x537=1) sends raw uninitialized BRAM bytes directly
+     * to the SerDes, BYPASSING the JESD 66b/64b encoder — no valid sync
+     * headers reach the AD9986 JRX.
+     *
+     * Instead, keep the TX in bidir+skip_data mode (0x947=2 from step 10,
+     * 0x540=0x01 from step 4).  In this mode the JESD IP encoder owns the
+     * TX path and inserts proper 66b/64b sync headers on every skip block,
+     * which is exactly what the AD9986 JRX needs for block sync. */
+    if (err = adi_ads9_reg_set(0x537, 4), err != API_CMS_ERROR_OK) {
+        printf("FPGA: gt_tx_ptn_play_stop failed (%d).\n", err);
+        return err;
+    }
+    if (err = adi_ad9986_jesd_rx_link_enable_set(dev, AD9986_LINK_ALL, 0),
+        err != API_CMS_ERROR_OK) {
+        printf("AD9986: JRX link disable (pre-cal) failed (%d).\n", err);
+        return err;
+    }
+    if (err = adi_ad9986_jesd_rx_link_enable_set(dev, AD9986_LINK_0, 1),
+        err != API_CMS_ERROR_OK) {
+        printf("AD9986: JRX link re-enable (pre-cal) failed (%d).\n", err);
+        return err;
+    }
+    printf("FPGA: GT play stopped, bidir+skip_data active — JESD encoder generates sync headers.\n");
+
+    /* Step 12: mandatory JESD204C PHY foreground calibration. */
+    if (err = adi_ad9986_jesd_rx_calibrate_204c(dev,
+              1 /*force_cal_reset*/, 0x00 /*boost_mask: 0=no boost, matches ref app*/,
+              0 /*run_bg_cal*/), err != API_CMS_ERROR_OK) {
+        printf("AD9986: JESD204C JRX PHY calibration failed (%d).\n", err);
+        return err;
+    }
+    printf("AD9986: JRX JESD204C PHY calibration complete.\n");
+
+    /* Step 13: Reset JRX link after calibration: disable all links, re-enable
+     * link 0.  Done twice to flush calibration state (matches ADS9 reference). */
+    if (err = adi_ad9986_jesd_rx_link_enable_set(dev, AD9986_LINK_ALL, 0),
+        err != API_CMS_ERROR_OK) {
+        printf("AD9986: JRX link disable (post-cal 1) failed (%d).\n", err);
+        return err;
+    }
+    if (err = adi_ad9986_jesd_rx_link_enable_set(dev, AD9986_LINK_0, 1),
+        err != API_CMS_ERROR_OK) {
+        printf("AD9986: JRX link re-enable (post-cal 1) failed (%d).\n", err);
+        return err;
+    }
+    if (err = adi_ad9986_jesd_rx_link_enable_set(dev, AD9986_LINK_ALL, 0),
+        err != API_CMS_ERROR_OK) {
+        printf("AD9986: JRX link disable (post-cal 2) failed (%d).\n", err);
+        return err;
+    }
+    if (err = adi_ad9986_jesd_rx_link_enable_set(dev, AD9986_LINK_0, 1),
+        err != API_CMS_ERROR_OK) {
+        printf("AD9986: JRX link re-enable (post-cal 2) failed (%d).\n", err);
+        return err;
+    }
+    printf("AD9986: JRX link reset after calibration complete.\n");
+
+    /* Step 14: Poll JRX 204C state every 2 s for 20 s.  Print AD9986 0x055E only. */
+    {
+        int      tick;
+        uint16_t jrx_poll = 0;
+        uint8_t  r055E = 0;
+        char dec[96];
+        printf("Polling JRX 204C state (every 2 s for 20 s):\n");
+        for (tick = 0; tick < 10; tick++) {
+            lattice_wait_us(NULL, 2000000);
+            adi_ad9986_jesd_rx_link_select_set(dev, AD9986_LINK_0);
+            adi_ad9986_hal_reg_get(dev, 0x055E, &r055E);
+            adi_ad9986_jesd_rx_link_status_get(dev, AD9986_LINK_0, &jrx_poll);
+            (void)jrx_poll;
+            printf("  t=%2ds:\n", (tick + 1) * 2);
+            snprintf(dec, sizeof(dec),
+                     "[7]=BF_JRX_DL_204C_ENABLE=%u  [6:4]=BF_JRX_DL_204C_STATE=%u  %s",
+                     (r055E >> 7) & 1, (r055E >> 4) & 7,
+                     ((r055E >> 4) & 7) == 6 ? "(link up)" : "(link down)");
+            app_reg_print_u8(0x055E, "REG_JRX_DL_204C_0", r055E, dec);
+            if (((r055E >> 4) & 7) == 6) {
+                printf("  JRX reached LINK_DATA (state=6)!\n");
+                break;
+            }
+        }
+    }
 
     printf("AD9986: JESD204C (index 1) configuration complete.\n");
     return API_CMS_ERROR_OK;
@@ -985,16 +1546,39 @@ int main(int argc, char *argv[])
             .reset_pin_ctrl = lattice_hw_rst_pin_ctrl_ad9986,
         },
         .clk_info = {
-            .sysref_mode = SYSREF_NONE,
+            .sysref_mode = SYSREF_CONT,
         },
         .serdes_info = {
+            /* JTX: AD9986 ADC serializer → FPGA RX.
+             * index = physical AD9986 JTX lane, value = logical lane it carries.
+             * Only physical lanes whose value < jesd_l are powered up.
+             * For L=1: only the entry equal to 0 selects the active physical lane.
+             * Update index N to 0 (and set all others to a value >= L) once the
+             * board schematic confirms which AD9986 JTX pin connects to the FPGA RX. */
+            .ser_settings = {
+                .lane_mapping = {
+                    /* link0 identity: logical 0 -> physical SERDOUT0.
+                     * Schematic 02-051884-01-f p6/p12: AD9986 SERDOUT0 = net FPGA_SERDIN_0
+                     * = FMC DP2_M2C = FPGA balls L34/M34 = rx_serial_data[0].  Identity is
+                     * REQUIRED so the framer emits on the lane the FPGA RX listens to.
+                     * (Was {1,0,...}, which put logical 0 on SERDOUT1 = DP0_M2C = dead lane.) */
+                    { 7, 0, 7, 7, 7, 7, 7, 7 },
+                    { 4, 5, 6, 7, 0, 1, 2, 3 }, /* link1 (unused for single-link) */
+                },
+            },
+            /* JRX: FPGA TX → AD9986 DAC deserializer.
+             * index = physical AD9986 JRX lane, value = logical lane it carries.
+             * Only physical lanes whose value < jesd_l are powered up.
+             * For L=1: only the entry equal to 0 selects the active physical lane.
+             * Update index M to 0 (and set all others to a value >= L) once the
+             * board schematic confirms which AD9986 JRX pin the FPGA TX drives. */
             .des_settings = {
                 /* CTLE filter 1-4 (valid range); 2 = mid insertion-loss setting.
                  * Required for QUART_RATE (JESD204C > 16 Gbps) deserializer path. */
                 .boost_mask  = 0xff,
                 .ctle_filter = { 2, 2, 2, 2, 2, 2, 2, 2 },
                 .lane_mapping = {
-                    { 0, 1, 2, 3, 4, 5, 6, 7 }, /* link0: physical lane i → logical lane i */
+                    { 0, 7, 7, 7, 7, 7, 7, 7 }, /* link0: identity — phys i → logical i */
                     { 4, 5, 6, 7, 0, 1, 2, 3 }, /* link1 (unused for single-link) */
                 },
             },
@@ -1082,9 +1666,19 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
 
+    /* SPI0 CS1: enable the ADCDRV differential output (ADC_CLK SMA on board).
+     * PD_ADC_DRIVER defaults to 1 (powered down); this clears it so the
+     * ADCDRV_P/N pins drive the ADC sample clock through the board balun. */
+    if (err = adi_ad9986_adc_clk_out_enable_set(&ad9986_dev, 1), err != API_CMS_ERROR_OK) {
+        printf("AD9986: ADCDRV output enable failed (%d).\n", err);
+        goto cleanup;
+    }
+    printf("AD9986: ADCDRV output enabled (ADC_CLK SMA active, %.2f MHz).\n",
+           (double)LATTICE_AD9986_ADC_CLK_HZ / 1.0e6);
+
     /* SPI0 CS1: configure AD9986 JESD204C datapath (uc_settings index 1 params).
      * Requires AD9986 clock PLL locked (above) and HMC7044 CH_13 SYSREF active (above). */
-    if (err = app_ad9986_jesd204c_config(&ad9986_dev), err != API_CMS_ERROR_OK) {
+    if (err = app_ad9986_jesd204c_bringup(&ad9986_dev), err != API_CMS_ERROR_OK) {
         goto cleanup;
     }
 
@@ -1118,11 +1712,15 @@ int main(int argc, char *argv[])
             printf("\nSelect an option:\n");
             printf("  1 - Run JESD IP register verify\n");
             printf("  2 - Run JESD IP register read\n");
-            printf("  3 - Check AD9986 JESD link status\n");
+            printf("  3 - Check AD9986 JESD link status (includes JRX/JTX lane rates)\n");
             printf("  4 - Configure AD9986 JESD204C (UC1 params, 7864.32 MHz clock)\n");
             printf("  5 - Check HMC7044 CH_13 SYSREF status\n");
             printf("  6 - Unmute HMC7044 CH_13 SYSREF output (clear force_mute)\n");
-            printf("  7 - Exit\n");
+            printf("  7 - Start AD9986 JTX framer PRBS7 at transport-layer input (ADC path → FPGA RX)\n");
+            printf("  8 - Stop  AD9986 JTX framer PRBS  (restore normal JESD sample data)\n");
+            printf("  9 - Read AD9986 204C error IRQ status once\n");
+            printf("  10 - AD9986 JRX sample PRBS7 checker (FPGA→AD9986, runs until error or Ctrl+C)\n");
+            printf("  11 - Exit\n");
             printf("Enter choice: ");
             if (scanf("%d", &user_choice) != 1) {
                 /* flush invalid input or exit on EOF */
@@ -1130,29 +1728,37 @@ int main(int argc, char *argv[])
                 if (feof(stdin))
                     break;
                 while ((c = getchar()) != '\n' && c != EOF);
-                printf("Invalid input. Please enter 1-7.\n");
+                printf("Invalid input. Please enter 1-11.\n");
                 continue;
             }
-            if (user_choice == 7) {
+            if (user_choice == 11) {
                 break;
-            } else if (user_choice >= 1 && user_choice <= 6) {
+            } else if (user_choice >= 1 && user_choice <= 9) {
                 pthread_mutex_lock(&g_spi_mtx);
                 if (user_choice == 1) {
                     err = app_jesd_ip_reg_verify();
                 } else if (user_choice == 2) {
                     app_jesd_ip_reg_read_test();
                 } else if (user_choice == 3) {
-                    app_ad9986_link_status_check(&ad9986_dev);
+                    app_ad9986_link_status_check(&ad9986_dev, &hmc7044_dev);
                 } else if (user_choice == 4) {
-                    app_ad9986_jesd204c_config(&ad9986_dev);
+                    app_ad9986_jesd204c_bringup(&ad9986_dev);
                 } else if (user_choice == 5) {
                     app_hmc7044_ch13_status(&hmc7044_dev);
-                } else {
+                } else if (user_choice == 6) {
                     app_hmc7044_ch13_unmute(&hmc7044_dev);
+                } else if (user_choice == 7) {
+                    app_ad9986_jtx_prbs_start(&ad9986_dev);
+                } else if (user_choice == 8) {
+                    app_ad9986_jtx_prbs_stop(&ad9986_dev);
+                } else {
+                    app_ad9986_irq_once(&ad9986_dev);
                 }
                 pthread_mutex_unlock(&g_spi_mtx);
+            } else if (user_choice == 10) {
+                app_ad9986_jrx_sample_prbs(&ad9986_dev);
             } else {
-                printf("Invalid choice. Please enter 1-7.\n");
+                printf("Invalid choice. Please enter 1-11.\n");
             }
         }
     }

@@ -114,6 +114,8 @@ static int32_t app_jesd_ip_init(void)
 {
     int32_t  err;
     uint32_t fpga_ver  = 0;
+    uint32_t probe_a   = 0;
+    uint32_t probe_b   = 0;
 
     /* Confirm the JESD IP register bridge is reachable over SPI0 CS0 by
      * reading the FPGA version registers (addr 0x100, 0x101).
@@ -127,6 +129,28 @@ static int32_t app_jesd_ip_init(void)
         printf("JESD IP: version read failed (%d) -- check SPI0 CS0 wiring.\n", err);
         return err;
     }
+
+    /* A successful transfer does not by itself mean the bridge decoded anything.
+     * When the FPGA SPI target does not implement the register commands it acts
+     * as a one-transaction-delayed loopback, and each read returns the address
+     * word that was clocked out rather than register content.  Reading two
+     * distinct addresses catches that: if both come back as the address itself,
+     * the bridge is echoing and no FPGA configuration write will ever land. */
+    if (ads9_axi_reg_read32(0x100, &probe_a) == API_CMS_ERROR_OK &&
+        ads9_axi_reg_read32(0x104, &probe_b) == API_CMS_ERROR_OK &&
+        probe_a == 0x100u && probe_b == 0x104u) {
+        printf("JESD IP: SPI0 CS0 bridge is ECHOING (read of 0x100 returned 0x%08x, "
+               "read of 0x104 returned 0x%08x).\n", probe_a, probe_b);
+        printf("JESD IP: the FPGA SPI target is not decoding register commands -- "
+               "no JESD IP configuration write will take effect.\n");
+        printf("JESD IP: check that the RISC-V register-bridge firmware is loaded "
+               "and running on the FPGA.\n");
+        /* Deliberately not fatal: the AD9986 and HMC7044 buses are independent
+         * of this bridge, so bring-up continues and the status dumps stay
+         * available for diagnosis.  Only the "bridge OK" claim is withheld. */
+        return API_CMS_ERROR_OK;
+    }
+
     printf("JESD IP (FPGA) image v%x -- SPI0 CS0 bridge OK.\n", fpga_ver);
     return API_CMS_ERROR_OK;
 }
@@ -138,19 +162,19 @@ static int32_t app_jesd_ip_reg_verify(void)
 
     /* Write/read verify: addr 0x11D is the JRX subclass register.
      * Called after clocks are up so the JESD IP register domain is active. */
-    if (err = app_jesd_ip_reg_write(0x011D, 0xDEADBEEF), err != API_CMS_ERROR_OK) {
+    if (err = app_jesd_ip_reg_write(0x40004000, 0x210), err != API_CMS_ERROR_OK) {
         return err;
     }
-    if (err = app_jesd_ip_reg_read(0x011D, &readback), err != API_CMS_ERROR_OK) {
+    if (err = app_jesd_ip_reg_read(0x40004000, &readback), err != API_CMS_ERROR_OK) {
         return err;
     }
-    if ((readback & 0xFFFFFFFF) != 0xDEADBEEF) {
+    if ((readback & 0xFFFFFFFF) != 0x210) {
         printf("JESD IP: register verify FAILED (wrote 0x01 to 0x011D, read 0x%08x).\n",
                readback);
         return API_CMS_ERROR_TEST_FAILED;
     }
     /* Restore JRX subclass to 0 (default = subclass 0) */
-    app_jesd_ip_reg_write(0x011D, 0x00000000);
+    app_jesd_ip_reg_write(0x40004000, 0x10);
     printf("JESD IP: register write/read verify OK.\n");
     return API_CMS_ERROR_OK;
 }
@@ -158,8 +182,17 @@ static int32_t app_jesd_ip_reg_verify(void)
 void app_jesd_ip_reg_read_test(void){
 	uint32_t readback = 0;
 
-	app_jesd_ip_reg_read(0x40003000, &readback);
-	printf("JESD IP: register read value: 0x%x\n", readback);
+	app_jesd_ip_reg_read(0x40005000, &readback);
+	printf("JESD IP: PHY register read value: 0x%x\n", readback);  
+	app_jesd_ip_reg_read(0x40006000, &readback);
+	printf("JESD IP: RX control register read value: 0x%x\n", readback);
+	app_jesd_ip_reg_read(0x40006004, &readback);
+	printf("JESD IP: RX status register read value: 0x%x\n", readback);
+	app_jesd_ip_reg_read(0x40004000, &readback);
+	printf("JESD IP: TX control register read value: 0x%x\n", readback);
+	app_jesd_ip_reg_read(0x40004004, &readback);
+	printf("JESD IP: TX status register read value: 0x%x\n", readback); 
+   
 }
 
 static int32_t app_ad9986_identify(adi_ad9986_device_t *dev)
@@ -1563,6 +1596,7 @@ int main(int argc, char *argv[])
                      * REQUIRED so the framer emits on the lane the FPGA RX listens to.
                      * (Was {1,0,...}, which put logical 0 on SERDOUT1 = DP0_M2C = dead lane.) */
                     { 7, 0, 7, 7, 7, 7, 7, 7 },
+                    //x2{ 7, 0, 7, 7, 7, 7, 7, 1 },
                     { 4, 5, 6, 7, 0, 1, 2, 3 }, /* link1 (unused for single-link) */
                 },
             },
@@ -1579,6 +1613,7 @@ int main(int argc, char *argv[])
                 .ctle_filter = { 2, 2, 2, 2, 2, 2, 2, 2 },
                 .lane_mapping = {
                     { 0, 7, 7, 7, 7, 7, 7, 7 }, /* link0: identity — phys i → logical i */
+                    //x2{ 0, 7, 7, 7, 1, 7, 7, 7 },
                     { 4, 5, 6, 7, 0, 1, 2, 3 }, /* link1 (unused for single-link) */
                 },
             },
@@ -1690,7 +1725,9 @@ int main(int argc, char *argv[])
             g_hmc_pll_state = st;
         if (adi_ad9986_device_clk_pll_lock_status_get(&ad9986_dev, &st) == API_CMS_ERROR_OK)
             g_ad9_pll_state = st;
-    }
+    }           
+
+#if 1 
     mon_ctx.hmc = &hmc7044_dev;
     mon_ctx.ad9 = &ad9986_dev;
     if (pthread_create(&mon_thread, NULL, pll_monitor_thread, &mon_ctx) == 0) {
@@ -1761,7 +1798,7 @@ int main(int argc, char *argv[])
                 printf("Invalid choice. Please enter 1-11.\n");
             }
         }
-    }
+    }      
     
     //if (err = app_jesd_ip_reg_read(0x04, &readback), err != API_CMS_ERROR_OK) {
         //return err;
@@ -1771,12 +1808,14 @@ int main(int argc, char *argv[])
     /* SPI0 CS0/CS1: FPGA JTX → AD9986 JRX PHY PRBS loopback test.
      * Runs after both PLLs are locked and the JESD IP is verified.
      * Change the pattern argument to PRBS9, PRBS15, PRBS23, or PRBS31 as needed. */
+    
     pthread_mutex_lock(&g_spi_mtx);
     err = app_ad9986_prbs_test(&ad9986_dev, PRBS7);
     pthread_mutex_unlock(&g_spi_mtx);
     if (err != API_CMS_ERROR_OK) {
         goto cleanup;
     }
+#endif          
 
     /* The full JESD link bring-up is available through the reused adi_ads9_*
      * API, e.g. adi_ads9_config_jesd(jrx_param, jtx_param) followed by the

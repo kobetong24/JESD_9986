@@ -98,8 +98,14 @@
 #endif
 
 /* SPI clock frequencies (Hz) */
+/* JESD IP bridge SPI clock is limited to 1 MHz for the same class of reason as
+ * the AD9986 bus below.  A mode/speed sweep on SPI0 CS0 showed that at 10 MHz in
+ * Mode 1 the returned words are shifted right by one bit with a stray leading
+ * one (the echo of 0xDEADBEEF came back as 0xEF56DF77 instead of 0x6F56DF77,
+ * and the echo of 0x0000011D came back as 0x0000008E).  At 1 MHz both Mode 0
+ * and Mode 1 are bit-exact.  Re-measure before raising this again. */
 #ifndef LATTICE_SPI_JESD_HZ
-#define LATTICE_SPI_JESD_HZ      10000000u
+#define LATTICE_SPI_JESD_HZ      1000000u
 #endif
 /* AD9986 SPI clock is intentionally limited to 1 MHz.
  * The Lattice FPGA acts as a proxy between SPI0 CS1 and the AD9986 SPI
@@ -153,21 +159,27 @@
 /*
  * JESD IP SPI register frame format (SPI0 CS0).
  *
- * Each transaction is 6 bytes, MSB first:
+ * The RISC-V SPI target IP on the FPGA takes exactly one 32-bit word per CS
+ * de-assertion, so a logical operation is a run of CS-separated 4-byte words,
+ * each transmitted MSB first:
  *
- *    byte0 : command  (0x02 = write, 0x03 = read)
- *    byte1 : [A7..A0]   8-bit register address
- *    byte2 : data[31:24]
- *    byte3 : data[23:16]
- *    byte4 : data[15:8]
- *    byte5 : data[7:0]
+ *    word0 : command, in the most significant byte (0x02 = write, 0x03 = read)
+ *    word1 : register address, full 32 bits
+ *    word2 : write -> data[31:0];  read -> dummy, response arrives here
  *
- * For a read, the host clocks out dummy bytes in byte2..5.  Because the
- * FPGA bridge drives MISO on the CLK rising edge (SPI Mode 1), the kernel
- * driver (CPHA=1) samples on the falling edge and the four data bytes land
- * in rx[0..3] — one half-cycle earlier than in Mode 0.
+ * A response always appears on the chip-select *after* the one that carried the
+ * corresponding request word, so a read needs a fourth CS: word2 returns the
+ * echo of the address and the read response lands on word3.  Measured on the
+ * board with a raw spidev probe:
  *
- * Adjust these macros to match the Lattice FPGA register-bridge RTL.
+ *    read 0x0943 -> f1=0x00000000 f2=0x03000000 f3=0x00000943 f4=0xBEEFDEAD
+ *    write 0x011D=5 -> f1=0x00000000 f2=0x02000000 f3=0x0000011D f4=0x00000005
+ *
+ * Every read currently answers with the LATTICE_JESD_READ_UNIMPL sentinel rather
+ * than register contents, so the bridge firmware recognises the read command but
+ * does not yet serve the JESD IP register file.
+ *
+ * Adjust these macros to match the Lattice FPGA register-bridge firmware.
  */
 #ifndef LATTICE_JESD_CMD_WRITE
 #define LATTICE_JESD_CMD_WRITE   0x02u  /* command byte for register write */
@@ -175,11 +187,21 @@
 #ifndef LATTICE_JESD_CMD_READ
 #define LATTICE_JESD_CMD_READ    0x03u  /* command byte for register read  */
 #endif
+/* Register addresses are transmitted at full 32-bit width.  This previously
+ * masked to 0xFFu, which truncated every address (0x011D and 0x051D both became
+ * 0x1D, and 0x0943 became 0x43), so every FPGA configuration write landed on the
+ * wrong register. */
 #ifndef LATTICE_JESD_ADDR_MASK
-#define LATTICE_JESD_ADDR_MASK   0xFFu  /* 8-bit register address          */
+#define LATTICE_JESD_ADDR_MASK   0xFFFFFFFFu  /* full-width register address */
 #endif
 #ifndef LATTICE_JESD_ADDR_SHIFT
 #define LATTICE_JESD_ADDR_SHIFT  0      /* 0: word address, 2: byte addr   */
+#endif
+/* Sentinel the bridge firmware returns in place of real register data. Reads
+ * that come back with this value are reported as API_CMS_ERROR_NOT_SUPPORTED so
+ * a missing register interface cannot be mistaken for valid content. */
+#ifndef LATTICE_JESD_READ_UNIMPL
+#define LATTICE_JESD_READ_UNIMPL 0xBEEFDEADu
 #endif
 
 /*

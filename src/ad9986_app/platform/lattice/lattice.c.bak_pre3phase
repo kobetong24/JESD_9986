@@ -158,26 +158,14 @@ static int32_t lattice_spi_xfer(int fd, uint32_t hz, uint8_t *tx, uint8_t *rx, u
  *   CS1 : [ cmd  , 0, 0, 0 ]   cmd  = 0x02 (write) or 0x03 (read)
  *   CS2 : [ a[31:24], a[23:16], a[15:8], a[7:0] ]   full-width register address
  *   CS3 : write -> [ d[31:24], d[23:16], d[15:8], d[7:0] ]
- *         read  -> dummy TX; the read response arrives here, MSB first.
+ *         read  -> dummy TX; returns the echo of the address word
+ *   CS4 : read only -> dummy TX; the read response arrives here, MSB first.
  *
  * The 8-bit command is placed in the first byte of its 4-byte word, so the
  * FPGA's 32-bit shift register captures it in the high byte of the FIFO word
  * (the IP shifts MSB-first). Address and data are transmitted big-endian so the
  * FIFO word arrives as the natural u32 on the MCU side.
- *
- * Inter-CS pacing
- * ---------------
- * The FPGA target decodes the address on CS2 and only then performs the APB
- * read and pre-loads its TX FIFO. Asserting CS3 before that completes makes the
- * response slip one CS behind its request. LATTICE_JESD_CS_DELAY_US paces the
- * phases so the response lands on the CS the target intends. Override it at
- * compile time (-DLATTICE_JESD_CS_DELAY_US=...) if the APB access is slower;
- * note that a JESD204C APB slave whose SERDES recovered clock is not running
- * can stall far longer than any practical delay here.
  * ------------------------------------------------------------------------- */
-#ifndef LATTICE_JESD_CS_DELAY_US
-#define LATTICE_JESD_CS_DELAY_US 2000u   /* pause between CS assertions, us */
-#endif
 int32_t ads9_axi_reg_write32(uint32_t reg_offset, uint32_t data)
 {
     uint32_t addr = (reg_offset << LATTICE_JESD_ADDR_SHIFT) & LATTICE_JESD_ADDR_MASK;
@@ -199,12 +187,8 @@ int32_t ads9_axi_reg_write32(uint32_t reg_offset, uint32_t data)
 
     err = lattice_spi_xfer(g_spi_jesd_fd, LATTICE_SPI_JESD_HZ, tx_cmd,  rx, 4);
     if (err != API_CMS_ERROR_OK) return err;
-    usleep(LATTICE_JESD_CS_DELAY_US);
-
     err = lattice_spi_xfer(g_spi_jesd_fd, LATTICE_SPI_JESD_HZ, tx_addr, rx, 4);
     if (err != API_CMS_ERROR_OK) return err;
-    usleep(LATTICE_JESD_CS_DELAY_US);
-
     err = lattice_spi_xfer(g_spi_jesd_fd, LATTICE_SPI_JESD_HZ, tx_data, rx, 4);
     if (err != API_CMS_ERROR_OK) return err;
 
@@ -225,8 +209,9 @@ int32_t ads9_axi_reg_read32(uint32_t reg_offset, uint32_t *out_data)
     uint8_t  tx_dummy[4] = { 0, 0, 0, 0 };
     uint8_t  rx_cmd[4]   = { 0 };
     uint8_t  rx_addr[4]  = { 0 };
+    uint8_t  rx_echo[4]  = { 0 };
     uint8_t  rx_data[4]  = { 0 };
-    uint32_t value;
+    uint32_t addr_echo, value;
     int32_t  err;
 
     if (out_data == NULL) {
@@ -236,27 +221,27 @@ int32_t ads9_axi_reg_read32(uint32_t reg_offset, uint32_t *out_data)
 
     err = lattice_spi_xfer(g_spi_jesd_fd, LATTICE_SPI_JESD_HZ, tx_cmd,   rx_cmd,  4);
     if (err != API_CMS_ERROR_OK) return err;
-    usleep(LATTICE_JESD_CS_DELAY_US);
-
     err = lattice_spi_xfer(g_spi_jesd_fd, LATTICE_SPI_JESD_HZ, tx_addr,  rx_addr, 4);
     if (err != API_CMS_ERROR_OK) return err;
-    /* Give the target time to complete the APB read and pre-load its TX FIFO
-     * before CS3, so the response lands on this phase rather than the next. */
-    usleep(LATTICE_JESD_CS_DELAY_US);
-
+    /* Responses lag one CS behind their request, so this phase returns the echo
+     * of the address word and the read data lands on the following phase. */
+    err = lattice_spi_xfer(g_spi_jesd_fd, LATTICE_SPI_JESD_HZ, tx_dummy, rx_echo, 4);
+    if (err != API_CMS_ERROR_OK) return err;
     err = lattice_spi_xfer(g_spi_jesd_fd, LATTICE_SPI_JESD_HZ, tx_dummy, rx_data, 4);
     if (err != API_CMS_ERROR_OK) return err;
 
     g_spi_rd_cnt++;
 
-    value = ((uint32_t)rx_data[0] << 24) | ((uint32_t)rx_data[1] << 16) |
-            ((uint32_t)rx_data[2] <<  8) | ((uint32_t)rx_data[3] <<  0);
+    addr_echo = ((uint32_t)rx_echo[0] << 24) | ((uint32_t)rx_echo[1] << 16) |
+                ((uint32_t)rx_echo[2] <<  8) | ((uint32_t)rx_echo[3] <<  0);
+    value     = ((uint32_t)rx_data[0] << 24) | ((uint32_t)rx_data[1] << 16) |
+                ((uint32_t)rx_data[2] <<  8) | ((uint32_t)rx_data[3] <<  0);
 
-    if (value == addr) {
-        printf("lattice: JESD IP read 0x%04X: response is the address echo "
-               "(0x%08X) -- the target had not pre-loaded its TX FIFO before "
-               "CS3; increase LATTICE_JESD_CS_DELAY_US (currently %u us).\r\n",
-               reg_offset, addr, (unsigned)LATTICE_JESD_CS_DELAY_US);
+    if (addr_echo != addr) {
+        printf("lattice: JESD IP read 0x%04X: address echo mismatch "
+               "(sent 0x%08X, echoed 0x%08X) -- bridge frame format differs "
+               "from the one documented in lattice.h.\r\n",
+               reg_offset, addr, addr_echo);
         return API_CMS_ERROR_SPI_XFER;
     }
     if (value == LATTICE_JESD_READ_UNIMPL) {

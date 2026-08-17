@@ -888,13 +888,17 @@ uint8_t jtx_chip_dcm[][2] = {
     { 1 }, /* uc41.link0 */
 };
 
-uint8_t jtx_logiclane_mapping_pe_brd[2][8] = { { 0, 1, 2, 3, 4, 5, 6, 7 }, { 4, 5, 6, 7, 0, 1, 2, 3 } }; 
-uint8_t jtx_logiclane_mapping_ce_brd[2][8] = { { 6, 4, 3, 2, 1, 0, 7, 5 }, { 2, 0, 7, 7, 7, 7, 3, 1 } }; 
+uint8_t jtx_logiclane_mapping_pe_brd[2][8] = { { 0, 1, 2, 3, 4, 5, 6, 7 }, { 4, 5, 6, 7, 0, 1, 2, 3 } };
+uint8_t jtx_logiclane_mapping_ce_brd[2][8] = { { 6, 4, 3, 2, 1, 0, 7, 5 }, { 2, 0, 7, 7, 7, 7, 3, 1 } };
+
+//.ser_settings = x1: { 7, 0, 7, 7, 7, 7, 7, 7 }, x2: { 7, 0, 7, 7, 7, 7, 7, 1 }, x4: { 2, 0, 7, 7, 7, 7, 3, 1 }
+//.des_settings = x1: { 0, 7, 7, 7, 7, 7, 7, 7 }, x2: { 0, 7, 7, 7, 1, 7, 7, 7 }, x4: { 0, 2, 7, 7, 1, 7, 7, 3 }
+
 adi_cms_jesd_param_t jrx_param[] = {
       /*L   F   M   S   HD  K    N    N'   CF  CS DID BID LID  SC SCR Dual V  Mode */
       { 8,  4,  16, 1,  0,  32,  16,  16,  0,  0,  0,  0,  0,  0,  1,  0,  1,  16 }, /* uc0 : nco test */
-      //{ 4,  4,  8,  1,  0,  32,  16,  16,  0,  0,  0,  0,  0,  0,  1,  0,  1,  9, }, /* uc1 : txmode = 194 */
-      { 1,  4,  2,  1,  0,  64,  16,  16,  0,  0,  0,  0,  0,  1,  0,  0,  2,  2, }, /* uc1 : JESD204C JRX (RPi ctrl-plane), 1L4F2M subclass1, jesdv=2 */
+      //{ 4,  4,  8,  1,  0,  32,  16,  16,  0,  0,  0,  0,  0,  1,  1,  0,  1,  9, }, /* uc1 : txmode = 194 */
+      { 1,  4,  2,  1,  0,  64,  16,  16,  0,  0,  0,  0,  0,  1,  1,  0,  2,  2, }, /* uc1 : JESD204C JRX (RPi ctrl-plane), 1L4F2M subclass1, jesdv=2 */
       { 8,  4,  16, 1,  0,  32,  16,  16,  0,  0,  0,  0,  0,  0,  1,  0,  1,  16 }, /* uc2 : txmode = 214 */
       { 4,  2,  4,  1,  0,  32,  16,  16,  0,  0,  0,  0,  0,  0,  1,  0,  1,  10 }, /* uc3 : txmode = 437 */
       { 4,  2,  4,  1,  0,  32,  16,  16,  0,  0,  0,  0,  0,  0,  1,  0,  1,  10 }, /* uc4 : txmode = 440 */
@@ -941,7 +945,7 @@ adi_cms_jesd_param_t jtx_param[][2] = {
       /*L   F   M   S   HD  K    N    N'   CF  CS DID BID LID  SC SCR Dual V  Mode C2R ModeS */
     { { 0 } }, /* uc0 : nco test */
     //{ { 4,  4,  8,  1,  1,  32,  16,  16,  0,  0,  0,  0,  0,  0,  1,  0,  1,  10,  0,  0 } }, /* uc1 : rxmode = 392, link0 */
-    { { 1,  4,  2,  1,  0,  64,  16,  16,  0,  0,  0,  0,  0,  1,  0,  0,  2,  3,   0,  0 } }, /* uc1 : JESD204C JTX (RPi ctrl-plane), 1L4F2M subclass1, jesdv=2 */
+    { { 1,  4,  2,  1,  0,  64,  16,  16,  0,  0,  0,  0,  0,  1,  1,  0,  2,  3,   0,  0 } }, /* uc1 : JESD204C JTX (RPi ctrl-plane), 1L4F2M subclass1, jesdv=2 */
     { { 4,  4,  8,  1,  1,  32,  16,  16,  0,  0,  0,  0,  0,  0,  1,  0,  1,  10,  0,  0 } }, /* uc2 : rxmode = 392, link0 */
     { { 2,  2,  2,  1,  1,  32,  16,  16,  0,  0,  0,  0,  0,  0,  1,  1,  1,  7,   0,  0 },   /* uc3 : rxmode = 360, link0 */
       { 2,  2,  2,  1,  1,  32,  16,  16,  0,  0,  0,  0,  0,  0,  1,  1,  1,  7,   0,  0 } }, /* uc3 : rxmode = 360, link1 */
@@ -997,4 +1001,3 @@ adi_cms_jesd_param_t jtx_param[][2] = {
     { { 8,  1,  4,  1,  0,  256, 12,  16,  0,  0,  0,  0,  0,  0,  1,  0,  2,  18,  0,  0 } }, /* uc41: rxmode = 252, link0 */
       /*L   F   M   S   HD  K    N    N'   CF  CS DID BID LID  SC SCR Dual V  Mode C2R ModeS */
 };
-
